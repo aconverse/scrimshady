@@ -1,0 +1,6 @@
+*.exe
+*.pdb
+*.obj
+*.o
+attic
+target/*

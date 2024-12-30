@@ -83,7 +83,7 @@ fn main() -> Result<()> {
         CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
     }
 
-    let window_class_w = w!("ScreenCaptureClass");
+    let window_class = w!("ScreenCaptureClass");
     let hinstance: HINSTANCE = unsafe { GetModuleHandleW(None) }?.into();
 
     let wc = WNDCLASSEXW {
@@ -91,7 +91,7 @@ fn main() -> Result<()> {
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(wndproc),
         hInstance: hinstance,
-        lpszClassName: PCWSTR(window_class_w.as_ptr()),
+        lpszClassName: window_class,
         ..Default::default()
     };
 
@@ -102,7 +102,7 @@ fn main() -> Result<()> {
     let hwnd = unsafe {
         CreateWindowExW(
             Default::default(),
-            PCWSTR(window_class_w.as_ptr()),
+            window_class,
             w!("Screen Capture"),
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
@@ -183,24 +183,21 @@ fn main() -> Result<()> {
         let res = D3DCompile(
             VERTEX_SHADER.as_ptr() as *const _,
             VERTEX_SHADER.len(),
-            PCSTR(std::ptr::null()), // source name (optional)
-            None,                    // defines (optional)
-            None,                    // include handler (optional)
-            s!("main"),              // entry point
-            s!("vs_4_0"),            // target profile
+            PCSTR::null(),                                   // source name (optional)
+            None,                                            // defines (optional)
+            None,                                            // include handler (optional)
+            s!("main"),                                      // entry point
+            s!("vs_4_0"),                                    // target profile
             D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION, // compilation flags
-            0,                       // secondary flags
-            &mut shader_blob,        // output blob
-            Some(&mut error_blob),   // error blob
+            0,                                               // secondary flags
+            &mut shader_blob,                                // output blob
+            Some(&mut error_blob),                           // error blob
         );
         println!("vertex shader compilation complete");
 
         if let Some(error) = error_blob {
-            let error_message = std::str::from_utf8(std::slice::from_raw_parts(
-                error.GetBufferPointer() as *const u8,
-                error.GetBufferSize(),
-            ))
-            .unwrap_or("Unknown error");
+            let error_message =
+                std::str::from_utf8(blob_as_slice(&error)).unwrap_or("Unknown error");
             println!("Shader compilation error: {}", error_message);
         }
 
@@ -209,9 +206,7 @@ fn main() -> Result<()> {
         let Some(blob) = shader_blob else {
             return Err(Error::new(E_FAIL, "Failed to compile vertex shader"));
         };
-        let shader_byte_code = {
-            std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize())
-        };
+        let shader_byte_code = blob_as_slice(&blob);
         let shader = {
             let mut shader_out = None;
             device.CreateVertexShader(shader_byte_code, None, Some(&mut shader_out))?;
@@ -268,11 +263,8 @@ fn main() -> Result<()> {
         println!("pixel shader compilation complete {:?}", res);
 
         if let Some(error) = error_blob {
-            let error_message = std::str::from_utf8(std::slice::from_raw_parts(
-                error.GetBufferPointer() as *const u8,
-                error.GetBufferSize(),
-            ))
-            .unwrap_or("Unknown error");
+            let error_message =
+                std::str::from_utf8(blob_as_slice(&error)).unwrap_or("Unknown error");
             println!("Shader compilation error: {}", error_message);
         }
 
@@ -283,11 +275,7 @@ fn main() -> Result<()> {
         };
 
         let mut shader_out = None;
-        device.CreatePixelShader(
-            std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()),
-            None,
-            Some(&mut shader_out),
-        )?;
+        device.CreatePixelShader(blob_as_slice(&blob), None, Some(&mut shader_out))?;
         shader_out.ok_or(E_POINTER)?
     };
     println!("created pixel shader");
@@ -629,4 +617,10 @@ fn capture_and_render_frame(state: &mut CaptureState, hwnd: HWND) -> Result<()> 
         }
     }
     Ok(())
+}
+
+fn blob_as_slice(blob: &ID3DBlob) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize())
+    }
 }

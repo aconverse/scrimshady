@@ -13,6 +13,7 @@ use windows::{
 };
 
 struct CaptureState {
+    start_time: std::time::Instant,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     swap_chain: IDXGISwapChain1,
@@ -24,6 +25,7 @@ struct CaptureState {
     render_target_view: Option<ID3D11RenderTargetView>,
     shader_resource_view: Option<ID3D11ShaderResourceView>,
     input_layout: ID3D11InputLayout,
+    time_buffer: ID3D11Buffer,
 }
 
 #[repr(C)]
@@ -50,6 +52,7 @@ VS_OUTPUT main(VS_INPUT input) {
     return output;
 }";
 
+/*
 const PIXEL_SHADER: &[u8] = b"
 Texture2D screenTexture : register(t0);
 SamplerState texSampler : register(s0);
@@ -57,6 +60,23 @@ SamplerState texSampler : register(s0);
 float4 main(float4 pos : SV_POSITION, float2 texCoord : TEXCOORD) : SV_Target {
     return screenTexture.Sample(texSampler, texCoord);
 }";
+*/
+
+const PIXEL_SHADER: &[u8] = b"
+Texture2D screenTexture : register(t0);
+SamplerState texSampler : register(s0);
+cbuffer TimeBuffer : register(b0) {
+    float Time;
+    float3 padding;
+}
+
+float4 main(float4 pos : SV_POSITION, float2 texCoord : TEXCOORD) : SV_Target {
+    float2 wavyCoord = texCoord;
+    wavyCoord.x += sin(texCoord.y * 10.0f + Time) * 0.02f;
+    wavyCoord.y += cos(texCoord.x * 10.0f + Time) * 0.02f;
+    return screenTexture.Sample(texSampler, wavyCoord);
+}
+";
 
 fn main() -> Result<()> {
     unsafe {
@@ -87,8 +107,8 @@ fn main() -> Result<()> {
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            800,
-            600,
+            1280,
+            720,
             None,
             None,
             hinstance,
@@ -338,7 +358,23 @@ fn main() -> Result<()> {
         buffer_out.ok_or(E_POINTER)?
     };
 
+    let time_buffer_desc = D3D11_BUFFER_DESC {
+        ByteWidth: 16,
+        Usage: D3D11_USAGE_DYNAMIC,
+        BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+        MiscFlags: 0,
+        StructureByteStride: 0,
+    };
+
+    let time_buffer = unsafe {
+        let mut buffer_out = None;
+        device.CreateBuffer(&time_buffer_desc, None, Some(&mut buffer_out))?;
+        buffer_out.ok_or(E_POINTER)?
+    };
+
     let capture_state = CaptureState {
+        start_time: std::time::Instant::now(),
         device,
         context,
         swap_chain,
@@ -350,6 +386,7 @@ fn main() -> Result<()> {
         render_target_view: None,
         shader_resource_view: None,
         input_layout,
+        time_buffer,
     };
     println!("created capture state");
 
@@ -394,7 +431,7 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 if !state_ptr.is_null() {
                     let state = &mut *state_ptr;
                     state.render_target_view = None;
-                    if let Err(_) = resize_swapchain(state) {
+                    if let Err(_) = resize_swapchain(state, hwnd) {
                         // Handle error if needed
                     }
                 }
@@ -404,7 +441,7 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut CaptureState;
                 if !state_ptr.is_null() {
                     let state = &mut *state_ptr;
-                    if let Err(_) = capture_and_render_frame(state) {
+                    if let Err(_) = capture_and_render_frame(state, hwnd) {
                         // Handle error if needed
                     }
                 }
@@ -415,24 +452,39 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
     }
 }
 
-fn resize_swapchain(state: &mut CaptureState) -> Result<()> {
-    if state.render_target_view.is_none() {
-        unsafe {
-            let buffer: ID3D11Texture2D = state.swap_chain.GetBuffer(0)?;
-            let mut render_target_view = None;
-            state
-                .device
-                .CreateRenderTargetView(&buffer, None, Some(&mut render_target_view))?;
-            if render_target_view.is_none() {
-                return Err(Error::new(E_FAIL, "failed to create render target view"));
-            }
-            state.render_target_view = render_target_view;
-        }
+fn resize_swapchain(state: &mut CaptureState, hwnd: HWND) -> Result<()> {
+    // Release old views
+    state.render_target_view = None;
+    state.shader_resource_view = None;
+
+    unsafe {
+        // Get new size
+        let mut client_rect = RECT::default();
+        GetClientRect(hwnd, &mut client_rect)?;
+        let width = (client_rect.right - client_rect.left) as u32;
+        let height = (client_rect.bottom - client_rect.top) as u32;
+
+        // Resize the swap chain
+        state.swap_chain.ResizeBuffers(
+            2,
+            width,
+            height,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            DXGI_SWAP_CHAIN_FLAG(0),
+        )?;
+
+        // Recreate render target view
+        let buffer: ID3D11Texture2D = state.swap_chain.GetBuffer(0)?;
+        let mut render_target_view = None;
+        state
+            .device
+            .CreateRenderTargetView(&buffer, None, Some(&mut render_target_view))?;
+        state.render_target_view = render_target_view;
     }
     Ok(())
 }
 
-fn capture_and_render_frame(state: &mut CaptureState) -> Result<()> {
+fn capture_and_render_frame(state: &mut CaptureState, hwnd: HWND) -> Result<()> {
     unsafe {
         let mut frame_resource = None;
         let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -484,21 +536,49 @@ fn capture_and_render_frame(state: &mut CaptureState) -> Result<()> {
                             state.shader_resource_view = shader_resource_view;
                         }
 
+                        // update time buffer
+                        {
+                            let time = state.start_time.elapsed().as_secs_f32();
+
+                            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                            state.context.Map(
+                                &state.time_buffer,
+                                0,
+                                D3D11_MAP_WRITE_DISCARD,
+                                0,
+                                Some(&mut mapped),
+                            )?;
+                            *(mapped.pData as *mut f32) = time;
+                            state.context.Unmap(&state.time_buffer, 0);
+
+                            state
+                                .context
+                                .PSSetConstantBuffers(0, Some(&[Some(state.time_buffer.clone())]));
+                        }
+
                         // Set up rendering pipeline
                         let rtv = state.render_target_view.as_ref().unwrap();
                         state
                             .context
                             .OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
 
-                        let viewport = D3D11_VIEWPORT {
-                            TopLeftX: 0.0,
-                            TopLeftY: 0.0,
-                            Width: 800.0,  // Should match window size
-                            Height: 600.0, // Should match window size
-                            MinDepth: 0.0,
-                            MaxDepth: 1.0,
+                        {
+                            // Get current window size
+                            let mut client_rect = RECT::default();
+                            GetClientRect(hwnd, &mut client_rect)?;
+                            let width = (client_rect.right - client_rect.left) as f32;
+                            let height = (client_rect.bottom - client_rect.top) as f32;
+
+                            let viewport = D3D11_VIEWPORT {
+                                TopLeftX: 0.0,
+                                TopLeftY: 0.0,
+                                Width: width,
+                                Height: height,
+                                MinDepth: 0.0,
+                                MaxDepth: 1.0,
+                            };
+                            state.context.RSSetViewports(Some(&[viewport]));
                         };
-                        state.context.RSSetViewports(Some(&[viewport]));
 
                         // Clear render target
                         state
@@ -537,6 +617,8 @@ fn capture_and_render_frame(state: &mut CaptureState) -> Result<()> {
 
                         // Present
                         state.swap_chain.Present(1, DXGI_PRESENT(0)).ok()?;
+
+                        //InvalidateRect(hwnd, None, false);
                     }
                 }
                 state.duplication.ReleaseFrame()?;

@@ -429,8 +429,9 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut CaptureState;
                 if !state_ptr.is_null() {
                     let state = &mut *state_ptr;
-                    if let Err(_) = capture_and_render_frame(state, hwnd) {
+                    if let Err(e) = capture_and_render_frame(state, hwnd) {
                         // Handle error if needed
+                        println!("error {:?}", e);
                     }
                 }
                 LRESULT(0)
@@ -611,8 +612,10 @@ fn capture_and_render_frame(state: &mut CaptureState, hwnd: HWND) -> Result<()> 
                 }
                 state.duplication.ReleaseFrame()?;
             }
-            Err(_) => {
-                // Frame acquisition timeout or error - continue
+            Err(e) => {
+                if e.code() != DXGI_ERROR_WAIT_TIMEOUT {
+                    return Err(e);
+                }
             }
         }
     }

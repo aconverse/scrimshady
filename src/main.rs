@@ -26,6 +26,9 @@ struct CaptureState {
     shader_resource_view: Option<ID3D11ShaderResourceView>,
     input_layout: ID3D11InputLayout,
     time_buffer: ID3D11Buffer,
+
+    staging_texture: Option<ID3D11Texture2D>,
+    screen_rect: RECT,
 }
 
 #[repr(C)]
@@ -116,6 +119,10 @@ fn main() -> Result<()> {
         )?
     };
     println!("created window");
+
+    unsafe {
+        SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)?;
+    }
 
     #[cfg(debug_assertions)]
     let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_DEBUG;
@@ -375,6 +382,8 @@ fn main() -> Result<()> {
         shader_resource_view: None,
         input_layout,
         time_buffer,
+        staging_texture: None,
+        screen_rect: RECT::default(),
     };
     println!("created capture state");
 
@@ -414,13 +423,21 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 PostQuitMessage(0);
                 LRESULT(0)
             }
-            WM_SIZE => {
+            WM_SIZE | WM_MOVE => {
                 let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut CaptureState;
                 if !state_ptr.is_null() {
                     let state = &mut *state_ptr;
-                    state.render_target_view = None;
-                    if let Err(_) = resize_swapchain(state, hwnd) {
-                        // Handle error if needed
+                    // Update screen position
+                    let mut window_rect = RECT::default();
+                    GetWindowRect(hwnd, &mut window_rect).ok();
+                    state.screen_rect = window_rect;
+
+                    if message == WM_SIZE {
+                        state.render_target_view = None;
+                        state.staging_texture = None; // Recreate on size change
+                        if let Err(_) = resize_swapchain(state, hwnd) {
+                            // Handle error if needed
+                        }
                     }
                 }
                 LRESULT(0)

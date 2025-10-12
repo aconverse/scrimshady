@@ -473,6 +473,129 @@ fn resize_swapchain(state: &mut CaptureState, hwnd: HWND) -> Result<()> {
     Ok(())
 }
 
+fn handle_frame(state: &mut CaptureState, frame_texture: IDXGIResource, hwnd: HWND) -> Result<()> {
+    unsafe {
+        // Create shader resource view if needed
+        if state.shader_resource_view.is_none() {
+            let mut shader_resource_view = None;
+            let resource: ID3D11Resource = frame_texture.cast()?;
+
+            let texture: ID3D11Texture2D = resource.cast()?;
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            texture.GetDesc(&mut desc);
+
+            println!("texture format {:?}", desc.Format);
+
+            let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+                Format: desc.Format,
+                ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: 1,
+                    },
+                },
+            };
+
+            state.device.CreateShaderResourceView(
+                &resource,
+                Some(&srv_desc),
+                Some(&mut shader_resource_view),
+            )?;
+
+            if shader_resource_view.is_none() {
+                return Err(Error::new(E_FAIL, "failed to create shader resource view"));
+            }
+            state.shader_resource_view = shader_resource_view;
+        }
+
+        // update time buffer
+        {
+            let time = state.start_time.elapsed().as_secs_f32();
+
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            state.context.Map(
+                &state.time_buffer,
+                0,
+                D3D11_MAP_WRITE_DISCARD,
+                0,
+                Some(&mut mapped),
+            )?;
+            *(mapped.pData as *mut f32) = time;
+            state.context.Unmap(&state.time_buffer, 0);
+
+            state
+                .context
+                .PSSetConstantBuffers(0, Some(&[Some(state.time_buffer.clone())]));
+        }
+
+        // Set up rendering pipeline
+        let rtv = state.render_target_view.as_ref().unwrap();
+        state
+            .context
+            .OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+
+        {
+            // Get current window size
+            let mut client_rect = RECT::default();
+            GetClientRect(hwnd, &mut client_rect)?;
+            let width = (client_rect.right - client_rect.left) as f32;
+            let height = (client_rect.bottom - client_rect.top) as f32;
+
+            let viewport = D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: width,
+                Height: height,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+            state.context.RSSetViewports(Some(&[viewport]));
+        };
+
+        // Clear render target
+        state
+            .context
+            .ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0]);
+
+        // Set shaders and resources
+        state.context.VSSetShader(&state.vertex_shader, None);
+        state.context.PSSetShader(&state.pixel_shader, None);
+        state
+            .context
+            .PSSetSamplers(0, Some(&[Some(state.sampler.clone())]));
+        state.context.PSSetShaderResources(
+            0,
+            Some(&[Some(state.shader_resource_view.as_ref().unwrap().clone())]),
+        );
+
+        // Set vertex buffer
+        let stride = std::mem::size_of::<Vertex>() as u32;
+        let offset = 0;
+        state.context.IASetVertexBuffers(
+            0,
+            1,
+            Some(&Some(state.vertex_buffer.clone())),
+            Some(&stride),
+            Some(&offset),
+        );
+        state
+            .context
+            .IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+
+        state.context.IASetInputLayout(&state.input_layout);
+
+        // Draw
+        state.context.Draw(4, 0);
+
+        // Present
+        state.swap_chain.Present(1, DXGI_PRESENT(0)).ok()?;
+
+        //InvalidateRect(hwnd, None, false);
+    }
+    Ok(())
+}
+
 fn capture_and_render_frame(state: &mut CaptureState, hwnd: HWND) -> Result<()> {
     unsafe {
         let mut frame_resource = None;
@@ -485,129 +608,7 @@ fn capture_and_render_frame(state: &mut CaptureState, hwnd: HWND) -> Result<()> 
             Ok(()) => {
                 if frame_info.LastPresentTime != 0 {
                     if let Some(frame_texture) = frame_resource {
-                        // Create shader resource view if needed
-                        if state.shader_resource_view.is_none() {
-                            let mut shader_resource_view = None;
-                            let resource: ID3D11Resource = frame_texture.cast()?;
-
-                            let texture: ID3D11Texture2D = resource.cast()?;
-                            let mut desc = D3D11_TEXTURE2D_DESC::default();
-                            texture.GetDesc(&mut desc);
-
-                            println!(
-                                "frame_info.LastPresentTime {} format {:?}",
-                                frame_info.LastPresentTime, desc.Format
-                            );
-
-                            let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
-                                Format: desc.Format,
-                                ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2D,
-                                Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
-                                    Texture2D: D3D11_TEX2D_SRV {
-                                        MostDetailedMip: 0,
-                                        MipLevels: 1,
-                                    },
-                                },
-                            };
-
-                            state.device.CreateShaderResourceView(
-                                &resource,
-                                Some(&srv_desc),
-                                Some(&mut shader_resource_view),
-                            )?;
-
-                            if shader_resource_view.is_none() {
-                                return Err(Error::new(
-                                    E_FAIL,
-                                    "failed to create shader resource view",
-                                ));
-                            }
-                            state.shader_resource_view = shader_resource_view;
-                        }
-
-                        // update time buffer
-                        {
-                            let time = state.start_time.elapsed().as_secs_f32();
-
-                            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                            state.context.Map(
-                                &state.time_buffer,
-                                0,
-                                D3D11_MAP_WRITE_DISCARD,
-                                0,
-                                Some(&mut mapped),
-                            )?;
-                            *(mapped.pData as *mut f32) = time;
-                            state.context.Unmap(&state.time_buffer, 0);
-
-                            state
-                                .context
-                                .PSSetConstantBuffers(0, Some(&[Some(state.time_buffer.clone())]));
-                        }
-
-                        // Set up rendering pipeline
-                        let rtv = state.render_target_view.as_ref().unwrap();
-                        state
-                            .context
-                            .OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
-
-                        {
-                            // Get current window size
-                            let mut client_rect = RECT::default();
-                            GetClientRect(hwnd, &mut client_rect)?;
-                            let width = (client_rect.right - client_rect.left) as f32;
-                            let height = (client_rect.bottom - client_rect.top) as f32;
-
-                            let viewport = D3D11_VIEWPORT {
-                                TopLeftX: 0.0,
-                                TopLeftY: 0.0,
-                                Width: width,
-                                Height: height,
-                                MinDepth: 0.0,
-                                MaxDepth: 1.0,
-                            };
-                            state.context.RSSetViewports(Some(&[viewport]));
-                        };
-
-                        // Clear render target
-                        state
-                            .context
-                            .ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0]);
-
-                        // Set shaders and resources
-                        state.context.VSSetShader(&state.vertex_shader, None);
-                        state.context.PSSetShader(&state.pixel_shader, None);
-                        state
-                            .context
-                            .PSSetSamplers(0, Some(&[Some(state.sampler.clone())]));
-                        state.context.PSSetShaderResources(
-                            0,
-                            Some(&[Some(state.shader_resource_view.as_ref().unwrap().clone())]),
-                        );
-
-                        // Set vertex buffer
-                        let stride = std::mem::size_of::<Vertex>() as u32;
-                        let offset = 0;
-                        state.context.IASetVertexBuffers(
-                            0,
-                            1,
-                            Some(&Some(state.vertex_buffer.clone())),
-                            Some(&stride),
-                            Some(&offset),
-                        );
-                        state
-                            .context
-                            .IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-
-                        state.context.IASetInputLayout(&state.input_layout);
-
-                        // Draw
-                        state.context.Draw(4, 0);
-
-                        // Present
-                        state.swap_chain.Present(1, DXGI_PRESENT(0)).ok()?;
-
-                        //InvalidateRect(hwnd, None, false);
+                        handle_frame(state, frame_texture, hwnd)?;
                     }
                 }
                 state.duplication.ReleaseFrame()?;

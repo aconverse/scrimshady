@@ -660,6 +660,56 @@ fn handle_frame(state: &mut CaptureState, frame_texture: IDXGIResource, hwnd: HW
     Ok(())
 }
 
+struct ReleaseFrameScope<'a>(Option<&'a IDXGIOutputDuplication>);
+
+impl Drop for ReleaseFrameScope<'_> {
+    fn drop(&mut self) {
+        _ = self.try_drop()
+    }
+}
+
+impl<'a> ReleaseFrameScope<'a> {
+    fn try_drop(&mut self) -> Result<()> {
+        if let Some(duplication) = self.0.take() {
+            unsafe { duplication.ReleaseFrame() }?;
+        }
+        Ok(())
+    }
+    pub fn release(mut self) -> Result<()> {
+        self.try_drop()
+    }
+    pub fn new(duplication: &'a IDXGIOutputDuplication) -> Self {
+        Self(Some(duplication))
+    }
+}
+
+struct AcquiredFrameScope<'a> {
+    pub info: DXGI_OUTDUPL_FRAME_INFO,
+    pub resource: Option<IDXGIResource>,
+    release_scope: ReleaseFrameScope<'a>,
+}
+
+impl AcquiredFrameScope<'_> {
+    fn release(self) -> Result<()> {
+        self.release_scope.release()
+    }
+}
+
+fn acquire_dxgi_duplication_frame<'a>(
+    duplication: &'a IDXGIOutputDuplication,
+    timeout_millis: u32,
+) -> Result<AcquiredFrameScope<'a>> {
+    let mut frame_resource = None;
+    let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
+    unsafe { duplication.AcquireNextFrame(timeout_millis, &mut frame_info, &mut frame_resource) }?;
+
+    Ok(AcquiredFrameScope {
+        info: frame_info,
+        resource: frame_resource,
+        release_scope: ReleaseFrameScope::new(duplication),
+    })
+}
+
 fn capture_and_render_frame(state: &mut CaptureState, hwnd: HWND) -> Result<()> {
     unsafe {
         if state.duplication.is_none() {
@@ -671,27 +721,21 @@ fn capture_and_render_frame(state: &mut CaptureState, hwnd: HWND) -> Result<()> 
         }
         let duplication = state.duplication.clone().unwrap();
 
-        let mut frame_resource = None;
-        let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
-
-        match duplication.AcquireNextFrame(0, &mut frame_info, &mut frame_resource) {
-            Ok(()) => {
-                let mut res = Ok(());
-                if frame_info.LastPresentTime != 0 {
-                    if let Some(frame_texture) = frame_resource {
-                        res = handle_frame(state, frame_texture, hwnd);
+        match acquire_dxgi_duplication_frame(&duplication, 0) {
+            Ok(frame) => {
+                if frame.info.LastPresentTime != 0 {
+                    if let Some(frame_texture) = frame.resource.clone() {
+                        handle_frame(state, frame_texture, hwnd)?;
                     }
                 }
-                let res2 = duplication.ReleaseFrame();
-                _ = res?;
-                _ = res2?;
+                frame.release()?;
             }
             Err(e) => {
                 if e.code() != DXGI_ERROR_WAIT_TIMEOUT {
                     return Err(e);
                 }
             }
-        }
+        };
     }
     Ok(())
 }

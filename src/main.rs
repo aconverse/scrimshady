@@ -17,7 +17,8 @@ struct CaptureState {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     swap_chain: IDXGISwapChain1,
-    duplication: IDXGIOutputDuplication,
+    dxgi_adapter: IDXGIAdapter,
+    duplication: Option<IDXGIOutputDuplication>,
     vertex_shader: ID3D11VertexShader,
     pixel_shader: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
@@ -176,12 +177,6 @@ fn main() -> Result<()> {
         dxgi_factory.CreateSwapChainForHwnd(&device, hwnd, &swap_chain_desc, None, None)?
     };
     println!("created swapchain");
-
-    // Set up screen capture
-    let output: IDXGIOutput = unsafe { dxgi_adapter.EnumOutputs(0)? };
-    let output1: IDXGIOutput1 = output.cast()?;
-    let duplication = unsafe { output1.DuplicateOutput(&device)? };
-    println!("created dxgi");
 
     // Create shaders
     let (vertex_shader, input_layout) = unsafe {
@@ -373,7 +368,8 @@ fn main() -> Result<()> {
         device,
         context,
         swap_chain,
-        duplication,
+        dxgi_adapter,
+        duplication: None,
         vertex_shader,
         pixel_shader,
         sampler,
@@ -449,6 +445,9 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     if let Err(e) = capture_and_render_frame(state, hwnd) {
                         // Handle error if needed
                         println!("error {:?}", e);
+                        if e.code() == DXGI_ERROR_ACCESS_LOST {
+                            state.duplication = None;
+                        }
                     }
                 }
                 LRESULT(0)
@@ -663,20 +662,29 @@ fn handle_frame(state: &mut CaptureState, frame_texture: IDXGIResource, hwnd: HW
 
 fn capture_and_render_frame(state: &mut CaptureState, hwnd: HWND) -> Result<()> {
     unsafe {
+        if state.duplication.is_none() {
+            // Set up screen capture
+            let output: IDXGIOutput = state.dxgi_adapter.EnumOutputs(0)?;
+            let output1: IDXGIOutput1 = output.cast()?;
+            state.duplication = Some(output1.DuplicateOutput(&state.device)?);
+            println!("created dxgi duplication");
+        }
+        let duplication = state.duplication.clone().unwrap();
+
         let mut frame_resource = None;
         let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
 
-        match state
-            .duplication
-            .AcquireNextFrame(0, &mut frame_info, &mut frame_resource)
-        {
+        match duplication.AcquireNextFrame(0, &mut frame_info, &mut frame_resource) {
             Ok(()) => {
+                let mut res = Ok(());
                 if frame_info.LastPresentTime != 0 {
                     if let Some(frame_texture) = frame_resource {
-                        handle_frame(state, frame_texture, hwnd)?;
+                        res = handle_frame(state, frame_texture, hwnd);
                     }
                 }
-                state.duplication.ReleaseFrame()?;
+                let res2 = duplication.ReleaseFrame();
+                _ = res?;
+                _ = res2?;
             }
             Err(e) => {
                 if e.code() != DXGI_ERROR_WAIT_TIMEOUT {

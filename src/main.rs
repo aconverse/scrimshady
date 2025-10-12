@@ -492,10 +492,58 @@ fn resize_swapchain(state: &mut CaptureState, hwnd: HWND) -> Result<()> {
 
 fn handle_frame(state: &mut CaptureState, frame_texture: IDXGIResource, hwnd: HWND) -> Result<()> {
     unsafe {
+        // Get client area in screen coordinates
+        let mut client_rect = RECT::default();
+        GetClientRect(hwnd, &mut client_rect)?;
+        let width = client_rect.right - client_rect.left;
+        let height = client_rect.bottom - client_rect.top;
+
+        // Create staging texture if needed (matches window size)
+        if state.staging_texture.is_none() {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: width as u32,
+                Height: height as u32,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+
+            let mut texture = None;
+            state
+                .device
+                .CreateTexture2D(&desc, None, Some(&mut texture))?;
+            state.staging_texture = texture;
+        }
+
+        // Copy the region under the window
+        let texture: ID3D11Texture2D = frame_texture.cast()?;
+        let dst_texture = state.staging_texture.as_ref().unwrap();
+
+        let src_box = D3D11_BOX {
+            left: state.screen_rect.left as u32,
+            top: state.screen_rect.top as u32,
+            front: 0,
+            right: (state.screen_rect.left + width) as u32,
+            bottom: (state.screen_rect.top + height) as u32,
+            back: 1,
+        };
+
+        state
+            .context
+            .CopySubresourceRegion(dst_texture, 0, 0, 0, 0, &texture, 0, Some(&src_box));
+
         // Create shader resource view if needed
         if state.shader_resource_view.is_none() {
             let mut shader_resource_view = None;
-            let resource: ID3D11Resource = frame_texture.cast()?;
+            let resource: ID3D11Resource = dst_texture.cast()?;
 
             let texture: ID3D11Texture2D = resource.cast()?;
             let mut desc = D3D11_TEXTURE2D_DESC::default();

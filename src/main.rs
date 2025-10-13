@@ -493,10 +493,18 @@ fn main() -> Result<()> {
     }
 
     let mut message = MSG::default();
-    while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
+    loop {
         unsafe {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
+            let status = GetMessageW(&mut message, None, 0, 0);
+            if status.0 == 0 {
+                break;
+            }
+            if status.0 == -1 {
+                println!("GetMessageW failed with -1");
+                break;
+            }
+            _ = TranslateMessage(&message);
+            _ = DispatchMessageW(&message);
         }
     }
 

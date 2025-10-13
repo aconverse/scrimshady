@@ -1,5 +1,4 @@
 use windows::{
-    core::*,
     Win32::{
         Foundation::*,
         Graphics::{
@@ -9,6 +8,7 @@ use windows::{
         System::LibraryLoader::*,
         UI::WindowsAndMessaging::*,
     },
+    core::*,
 };
 
 struct CaptureState {
@@ -28,7 +28,7 @@ struct CaptureState {
     time_buffer: ID3D11Buffer,
 
     staging_texture: Option<ID3D11Texture2D>,
-    screen_rect: RECT,
+    source_rect: RECT,
 }
 
 #[repr(C)]
@@ -55,15 +55,13 @@ VS_OUTPUT main(VS_INPUT input) {
     return output;
 }";
 
-/*
-const PIXEL_SHADER: &[u8] = b"
+const PIXEL_SHADER_PASSTHRU: &[u8] = b"
 Texture2D screenTexture : register(t0);
 SamplerState texSampler : register(s0);
 
 float4 main(float4 pos : SV_POSITION, float2 texCoord : TEXCOORD) : SV_Target {
     return screenTexture.Sample(texSampler, texCoord);
 }";
-*/
 
 const PIXEL_SHADER: &[u8] = b"
 Texture2D screenTexture : register(t0);
@@ -378,7 +376,7 @@ fn main() -> Result<()> {
         input_layout,
         time_buffer,
         staging_texture: None,
-        screen_rect: RECT::default(),
+        source_rect: RECT::default(),
     };
     println!("created capture state");
 
@@ -423,9 +421,16 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 if !state_ptr.is_null() {
                     let state = &mut *state_ptr;
                     // Update screen position
-                    let mut window_rect = RECT::default();
-                    GetWindowRect(hwnd, &mut window_rect).ok();
-                    state.screen_rect = window_rect;
+                    let mut client_origin = POINT::default();
+                    ClientToScreen(hwnd, &mut client_origin);
+                    let mut client_rect = RECT::default();
+                    GetClientRect(hwnd, &mut client_rect);
+                    let mut source_rect = client_rect;
+                    source_rect.left += client_origin.x;
+                    source_rect.right += client_origin.x;
+                    source_rect.top += client_origin.y;
+                    source_rect.bottom += client_origin.y;
+                    state.source_rect = source_rect;
 
                     if message == WM_SIZE {
                         state.render_target_view = None;
@@ -526,11 +531,11 @@ fn handle_frame(state: &mut CaptureState, frame_texture: IDXGIResource, hwnd: HW
         let dst_texture = state.staging_texture.as_ref().unwrap();
 
         let src_box = D3D11_BOX {
-            left: state.screen_rect.left as u32,
-            top: state.screen_rect.top as u32,
+            left: state.source_rect.left as u32,
+            top: state.source_rect.top as u32,
             front: 0,
-            right: (state.screen_rect.left + width) as u32,
-            bottom: (state.screen_rect.top + height) as u32,
+            right: (state.source_rect.left + width) as u32,
+            bottom: (state.source_rect.top + height) as u32,
             back: 1,
         };
 

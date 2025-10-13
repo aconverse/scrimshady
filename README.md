@@ -1,2 +1,2 @@
-# ShaderHost
-A tiny win32 app to act as a host when playing with shaders
+# Scrim Shady
+A tiny win32 app to apply a shader to the pixels underneath.

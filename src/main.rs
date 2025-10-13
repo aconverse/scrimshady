@@ -1,4 +1,3 @@
-use std::ptr;
 use windows::{
     core::*,
     Win32::{
@@ -115,7 +114,7 @@ fn main() -> Result<()> {
             720,
             None,
             None,
-            hinstance,
+            Some(hinstance),
             None,
         )?
     };
@@ -137,7 +136,7 @@ fn main() -> Result<()> {
         D3D11CreateDevice(
             None,
             D3D_DRIVER_TYPE_HARDWARE,
-            None,
+            HMODULE::default(),
             flags,
             None,
             D3D11_SDK_VERSION,
@@ -395,7 +394,7 @@ fn main() -> Result<()> {
     }
 
     let mut message = MSG::default();
-    while unsafe { GetMessageW(&mut message, HWND(ptr::null_mut()), 0, 0) }.as_bool() {
+    while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
         unsafe {
             TranslateMessage(&message);
             DispatchMessageW(&message);

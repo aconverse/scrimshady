@@ -20,6 +20,8 @@ struct CaptureState {
     duplication: Option<IDXGIOutputDuplication>,
     vertex_shader: ID3D11VertexShader,
     pixel_shader: ID3D11PixelShader,
+    compute_shader: ID3D11ComputeShader,
+    extend_params_buffer: ID3D11Buffer,
     sampler: ID3D11SamplerState,
     vertex_buffer: ID3D11Buffer,
     render_target_view: Option<ID3D11RenderTargetView>,
@@ -28,6 +30,9 @@ struct CaptureState {
     time_buffer: ID3D11Buffer,
 
     staging_texture: Option<ID3D11Texture2D>,
+    extended_texture: Option<ID3D11Texture2D>,
+    extended_srv: Option<ID3D11ShaderResourceView>,
+    extended_uav: Option<ID3D11UnorderedAccessView>,
     source_rect: RECT,
 }
 
@@ -53,6 +58,44 @@ VS_OUTPUT main(VS_INPUT input) {
     output.pos = float4(input.pos, 0.0f, 1.0f);
     output.tex = input.tex;
     return output;
+}";
+
+#[repr(C)]
+struct ExtendParams {
+    src_size: [u32; 2],
+    dst_size: [u32; 2],
+    src_offset: [i32; 2],
+    padding: [u32; 2],
+}
+
+const EXTEND_COMPUTE_SHADER: &[u8] = b"
+Texture2D<float4> srcTexture : register(t0);
+RWTexture2D<float4> dstTexture : register(u0);
+
+cbuffer ExtendParams : register(b0) {
+    uint2 srcSize;
+    uint2 dstSize;
+    int2 srcOffset;  // Where the source starts in the destination
+    uint2 padding;
+}
+
+[numthreads(8, 8, 1)]
+void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
+    uint2 dstPos = dispatchThreadID.xy;
+
+    if (dstPos.x >= dstSize.x || dstPos.y >= dstSize.y)
+        return;
+
+    // Calculate source position (may be out of bounds)
+    int2 srcPos = int2(dstPos) - srcOffset;
+
+    // Clamp to source texture bounds (sample and hold)
+    srcPos.x = clamp(srcPos.x, 0, (int)srcSize.x - 1);
+    srcPos.y = clamp(srcPos.y, 0, (int)srcSize.y - 1);
+
+    // Read from source and write to destination
+    float4 color = srcTexture.Load(int3(srcPos, 0));
+    dstTexture[dstPos] = color;
 }";
 
 const PIXEL_SHADER_PASSTHRU: &[u8] = b"
@@ -279,6 +322,59 @@ fn main() -> Result<()> {
     };
     println!("created pixel shader");
 
+    // Create compute shader for texture extension
+    let compute_shader = unsafe {
+        let mut shader_blob: Option<ID3DBlob> = None;
+        let mut error_blob = None;
+        let res = D3DCompile(
+            EXTEND_COMPUTE_SHADER.as_ptr() as *const _,
+            EXTEND_COMPUTE_SHADER.len(),
+            None,                                            // source name (optional)
+            None,                                            // defines (optional)
+            None,                                            // include handler (optional)
+            s!("main"),                                      // entry point
+            s!("cs_5_0"),                                    // target profile
+            D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION, // compilation flags
+            0,                                               // secondary flags
+            &mut shader_blob,                                // output blob
+            Some(&mut error_blob),                           // error blob
+        );
+        println!("compute shader compilation complete {:?}", res);
+
+        if let Some(error) = error_blob {
+            let error_message =
+                std::str::from_utf8(blob_as_slice(&error)).unwrap_or("Unknown error");
+            println!("Compute shader compilation error: {}", error_message);
+        }
+
+        res?;
+
+        let Some(blob) = shader_blob else {
+            return Err(Error::new(E_FAIL, "Failed to compile compute shader"));
+        };
+
+        let mut shader_out = None;
+        device.CreateComputeShader(blob_as_slice(&blob), None, Some(&mut shader_out))?;
+        shader_out.ok_or(E_POINTER)?
+    };
+    println!("created compute shader");
+
+    // Create extend params buffer
+    let extend_params_buffer_desc = D3D11_BUFFER_DESC {
+        ByteWidth: std::mem::size_of::<ExtendParams>() as u32,
+        Usage: D3D11_USAGE_DYNAMIC,
+        BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+        MiscFlags: 0,
+        StructureByteStride: 0,
+    };
+
+    let extend_params_buffer = unsafe {
+        let mut buffer_out = None;
+        device.CreateBuffer(&extend_params_buffer_desc, None, Some(&mut buffer_out))?;
+        buffer_out.ok_or(E_POINTER)?
+    };
+
     // Create sampler state
     let sampler_desc = D3D11_SAMPLER_DESC {
         Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
@@ -369,6 +465,8 @@ fn main() -> Result<()> {
         duplication: None,
         vertex_shader,
         pixel_shader,
+        compute_shader,
+        extend_params_buffer,
         sampler,
         vertex_buffer,
         render_target_view: None,
@@ -376,6 +474,9 @@ fn main() -> Result<()> {
         input_layout,
         time_buffer,
         staging_texture: None,
+        extended_texture: None,
+        extended_srv: None,
+        extended_uav: None,
         source_rect: RECT::default(),
     };
     println!("created capture state");
@@ -435,6 +536,9 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     if message == WM_SIZE {
                         state.render_target_view = None;
                         state.staging_texture = None; // Recreate on size change
+                        state.extended_texture = None; // Recreate on size change
+                        state.extended_srv = None;
+                        state.extended_uav = None;
                         if let Err(_) = resize_swapchain(state, hwnd) {
                             // Handle error if needed
                         }
@@ -501,6 +605,27 @@ fn handle_frame(state: &mut CaptureState, frame_texture: IDXGIResource, hwnd: HW
         let width = client_rect.right - client_rect.left;
         let height = client_rect.bottom - client_rect.top;
 
+        // Get screen texture dimensions
+        let texture: ID3D11Texture2D = frame_texture.cast()?;
+        let mut screen_desc = D3D11_TEXTURE2D_DESC::default();
+        texture.GetDesc(&mut screen_desc);
+
+        // Calculate source box (may extend beyond screen bounds)
+        let src_left = state.source_rect.left;
+        let src_top = state.source_rect.top;
+        let src_right = state.source_rect.left + width;
+        let src_bottom = state.source_rect.top + height;
+
+        // Calculate how much we extend beyond screen bounds
+        let extend_left = (-src_left).max(0);
+        let extend_top = (-src_top).max(0);
+        let extend_right = (src_right - screen_desc.Width as i32).max(0);
+        let extend_bottom = (src_bottom - screen_desc.Height as i32).max(0);
+
+        // Calculate extended texture size
+        let extended_width = (width + extend_left + extend_right) as u32;
+        let extended_height = (height + extend_top + extend_bottom) as u32;
+
         // Create staging texture if needed (matches window size)
         if state.staging_texture.is_none() {
             let desc = D3D11_TEXTURE2D_DESC {
@@ -519,43 +644,58 @@ fn handle_frame(state: &mut CaptureState, frame_texture: IDXGIResource, hwnd: HW
                 MiscFlags: 0,
             };
 
-            let mut texture = None;
+            let mut texture_out = None;
             state
                 .device
-                .CreateTexture2D(&desc, None, Some(&mut texture))?;
-            state.staging_texture = texture;
+                .CreateTexture2D(&desc, None, Some(&mut texture_out))?;
+            state.staging_texture = texture_out;
         }
 
-        // Copy the region under the window
-        let texture: ID3D11Texture2D = frame_texture.cast()?;
-        let dst_texture = state.staging_texture.as_ref().unwrap();
+        // Create extended texture if needed
+        if state.extended_texture.is_none() {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: extended_width,
+                Height: extended_height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_UNORDERED_ACCESS.0) as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
 
-        let src_box = D3D11_BOX {
-            left: state.source_rect.left as u32,
-            top: state.source_rect.top as u32,
-            front: 0,
-            right: (state.source_rect.left + width) as u32,
-            bottom: (state.source_rect.top + height) as u32,
-            back: 1,
-        };
+            let mut texture_out = None;
+            state
+                .device
+                .CreateTexture2D(&desc, None, Some(&mut texture_out))?;
+            state.extended_texture = texture_out;
 
-        state
-            .context
-            .CopySubresourceRegion(dst_texture, 0, 0, 0, 0, &texture, 0, Some(&src_box));
+            // Create UAV for compute shader output
+            let extended_tex = state.extended_texture.as_ref().unwrap();
+            let uav_desc = D3D11_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                ViewDimension: D3D11_UAV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_UAV { MipSlice: 0 },
+                },
+            };
 
-        // Create shader resource view if needed
-        if state.shader_resource_view.is_none() {
-            let mut shader_resource_view = None;
-            let resource: ID3D11Resource = dst_texture.cast()?;
+            let mut uav_out = None;
+            state.device.CreateUnorderedAccessView(
+                extended_tex,
+                Some(&uav_desc),
+                Some(&mut uav_out),
+            )?;
+            state.extended_uav = uav_out;
 
-            let texture: ID3D11Texture2D = resource.cast()?;
-            let mut desc = D3D11_TEXTURE2D_DESC::default();
-            texture.GetDesc(&mut desc);
-
-            println!("texture format {:?}", desc.Format);
-
+            // Create SRV for the extended texture
             let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
-                Format: desc.Format,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
                 ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2D,
                 Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
                     Texture2D: D3D11_TEX2D_SRV {
@@ -565,16 +705,122 @@ fn handle_frame(state: &mut CaptureState, frame_texture: IDXGIResource, hwnd: HW
                 },
             };
 
+            let mut srv_out = None;
             state.device.CreateShaderResourceView(
-                &resource,
+                extended_tex,
                 Some(&srv_desc),
-                Some(&mut shader_resource_view),
+                Some(&mut srv_out),
             )?;
+            state.extended_srv = srv_out;
+        }
 
-            if shader_resource_view.is_none() {
-                return Err(Error::new(E_FAIL, "failed to create shader resource view"));
-            }
-            state.shader_resource_view = shader_resource_view;
+        // Clamp source box to valid screen coordinates
+        let clamped_left = src_left.max(0).min(screen_desc.Width as i32);
+        let clamped_top = src_top.max(0).min(screen_desc.Height as i32);
+        let clamped_right = src_right.max(0).min(screen_desc.Width as i32);
+        let clamped_bottom = src_bottom.max(0).min(screen_desc.Height as i32);
+
+        // Copy the valid region to staging texture
+        let dst_texture = state.staging_texture.as_ref().unwrap();
+
+        if clamped_right > clamped_left && clamped_bottom > clamped_top {
+            let src_box = D3D11_BOX {
+                left: clamped_left as u32,
+                top: clamped_top as u32,
+                front: 0,
+                right: clamped_right as u32,
+                bottom: clamped_bottom as u32,
+                back: 1,
+            };
+
+            // Destination offset should be zero - we're copying to a window-sized texture
+            // The extension happens in the compute shader
+            let dst_x = 0;
+            let dst_y = 0;
+
+            state.context.CopySubresourceRegion(
+                dst_texture,
+                0,
+                dst_x,
+                dst_y,
+                0,
+                &texture,
+                0,
+                Some(&src_box),
+            );
+        }
+
+        // Create SRV for staging texture if needed
+        if state.shader_resource_view.is_none() {
+            let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: 1,
+                    },
+                },
+            };
+
+            let mut srv_out = None;
+            state.device.CreateShaderResourceView(
+                dst_texture,
+                Some(&srv_desc),
+                Some(&mut srv_out),
+            )?;
+            state.shader_resource_view = srv_out;
+        }
+
+        // Run compute shader to extend the texture with edge padding
+        {
+            let params = ExtendParams {
+                src_size: [width as u32, height as u32],
+                dst_size: [extended_width, extended_height],
+                src_offset: [extend_left, extend_top],
+                padding: [0, 0],
+            };
+
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            state.context.Map(
+                &state.extend_params_buffer,
+                0,
+                D3D11_MAP_WRITE_DISCARD,
+                0,
+                Some(&mut mapped),
+            )?;
+            std::ptr::copy_nonoverlapping(
+                &params as *const ExtendParams as *const u8,
+                mapped.pData as *mut u8,
+                std::mem::size_of::<ExtendParams>(),
+            );
+            state.context.Unmap(&state.extend_params_buffer, 0);
+
+            state.context.CSSetShader(&state.compute_shader, None);
+            state
+                .context
+                .CSSetConstantBuffers(0, Some(&[Some(state.extend_params_buffer.clone())]));
+            state.context.CSSetShaderResources(
+                0,
+                Some(&[Some(state.shader_resource_view.as_ref().unwrap().clone())]),
+            );
+            state.context.CSSetUnorderedAccessViews(
+                0,
+                1,
+                Some(&Some(state.extended_uav.as_ref().unwrap().clone())),
+                None,
+            );
+
+            let dispatch_x = (extended_width + 7) / 8;
+            let dispatch_y = (extended_height + 7) / 8;
+            state.context.Dispatch(dispatch_x, dispatch_y, 1);
+
+            // Clear compute shader resources
+            state.context.CSSetShader(None, None);
+            state.context.CSSetShaderResources(0, Some(&[None]));
+            state
+                .context
+                .CSSetUnorderedAccessViews(0, 1, Some(&None), None);
         }
 
         // update time buffer
@@ -632,9 +878,10 @@ fn handle_frame(state: &mut CaptureState, frame_texture: IDXGIResource, hwnd: HW
         state
             .context
             .PSSetSamplers(0, Some(&[Some(state.sampler.clone())]));
+        // Use the extended texture instead of staging texture
         state.context.PSSetShaderResources(
             0,
-            Some(&[Some(state.shader_resource_view.as_ref().unwrap().clone())]),
+            Some(&[Some(state.extended_srv.as_ref().unwrap().clone())]),
         );
 
         // Set vertex buffer

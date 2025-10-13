@@ -774,6 +774,9 @@ fn handle_frame(state: &mut CaptureState, frame_texture: IDXGIResource, hwnd: HW
 
         // Run compute shader to extend the texture with edge padding
         {
+            // Unbind pixel shader resources to avoid hazards
+            state.context.PSSetShaderResources(0, Some(&[None]));
+
             let params = ExtendParams {
                 src_size: [width as u32, height as u32],
                 dst_size: [extended_width, extended_height],

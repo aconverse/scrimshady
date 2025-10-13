@@ -546,6 +546,16 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 }
                 LRESULT(0)
             }
+            WM_SETCURSOR => {
+                // If the cursor is in the client area, set it to the arrow
+                if (lparam.0 as u32 & 0xFFFF) == HTCLIENT as u32 {
+                    SetCursor(LoadCursorW(None, IDC_ARROW).ok());
+                    LRESULT(1) // TRUE - we handled it
+                } else {
+                    // Let Windows handle non-client areas (borders, title bar, etc.)
+                    DefWindowProcW(hwnd, message, wparam, lparam)
+                }
+            }
             WM_PAINT => {
                 let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut CaptureState;
                 if !state_ptr.is_null() {

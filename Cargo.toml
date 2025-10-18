@@ -3,6 +3,10 @@ name = "scrimshady"
 version = "0.1.0"
 edition = "2024"
 
+[dependencies.time]
+version = "0.3.44"
+features = ["std", "local-offset", "formatting", "parsing", "macros"]
+
 [dependencies.windows]
 version = "0.62.2"
 features = [
@@ -13,7 +17,10 @@ features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_LibraryLoader",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ]

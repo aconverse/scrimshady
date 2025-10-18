@@ -3,9 +3,11 @@ use windows::{
         Foundation::*,
         Graphics::{
             Direct3D::Fxc::*, Direct3D::*, Direct3D11::*, Dxgi::Common::*, Dxgi::*, Gdi::*,
+            Imaging::*,
         },
         System::Com::*,
         System::LibraryLoader::*,
+        UI::Input::KeyboardAndMouse::*,
         UI::WindowsAndMessaging::*,
     },
     core::*,
@@ -34,6 +36,9 @@ struct CaptureState {
     extended_srv: Option<ID3D11ShaderResourceView>,
     extended_uav: Option<ID3D11UnorderedAccessView>,
     source_rect: RECT,
+
+    always_on_top: bool,
+    hwnd: HWND,
 }
 
 #[repr(C)]
@@ -478,6 +483,8 @@ fn main() -> Result<()> {
         extended_srv: None,
         extended_uav: None,
         source_rect: RECT::default(),
+        always_on_top: false,
+        hwnd,
     };
     println!("created capture state");
 
@@ -578,9 +585,181 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 }
                 LRESULT(0)
             }
+            WM_KEYDOWN => {
+                let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut CaptureState;
+                if !state_ptr.is_null() {
+                    let state = &mut *state_ptr;
+                    let vkey = wparam.0 as i32;
+
+                    // Check if Ctrl is pressed
+                    let ctrl_pressed = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
+
+                    if ctrl_pressed {
+                        match vkey {
+                            0x53 => {
+                                // 'S' key
+                                if let Err(e) = save_frame_to_png(state) {
+                                    println!("Failed to save frame: {:?}", e);
+                                }
+                            }
+                            0x41 => {
+                                // 'A' key
+                                if let Err(e) = toggle_always_on_top(state) {
+                                    println!("Failed to toggle always on top: {:?}", e);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
             _ => DefWindowProcW(hwnd, message, wparam, lparam),
         }
     }
+}
+
+fn save_frame_to_png(state: &mut CaptureState) -> Result<()> {
+    unsafe {
+        // Get the back buffer from the swap chain (this has the shaded output)
+        let back_buffer: ID3D11Texture2D = state.swap_chain.GetBuffer(0)?;
+
+        // Get texture description
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        back_buffer.GetDesc(&mut desc);
+
+        // Create a staging texture for CPU readback
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Width: desc.Width,
+            Height: desc.Height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: desc.Format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+
+        let mut staging_texture = None;
+        state
+            .device
+            .CreateTexture2D(&staging_desc, None, Some(&mut staging_texture))?;
+        let staging_texture = staging_texture.ok_or(E_POINTER)?;
+
+        // Copy the back buffer to staging
+        state.context.CopyResource(&staging_texture, &back_buffer);
+
+        let width = desc.Width;
+        let height = desc.Height;
+        // Write pixels
+        let (pixel_buffer, stride) = {
+            let mut pixel_buffer = Vec::new();
+
+            // Map the staging texture to read the pixels
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            state
+                .context
+                .Map(&staging_texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+
+            let stride = mapped.RowPitch;
+            let buffer_size = stride * height;
+            pixel_buffer.extend_from_slice(std::slice::from_raw_parts(
+                mapped.pData as *const u8,
+                buffer_size as usize,
+            ));
+
+            // Unmap the texture
+            state.context.Unmap(&staging_texture, 0);
+
+            (pixel_buffer, stride)
+        };
+
+        // Generate timestamped filename
+        let now = {
+            let t = time::OffsetDateTime::now_utc();
+            match time::UtcOffset::local_offset_at(t) {
+                Ok(offset) => t.to_offset(offset),
+                Err(_) => t,
+            }
+        };
+        let format: &[time::format_description::FormatItem<'_>] = time::macros::format_description!(
+            "[year]-[month]-[day]_[hour]_[minute]_[second]_[subsecond digits:3]"
+        );
+        let timestamp = now.format(format).unwrap();
+        let filename = format!("scrimshady_{}.png", timestamp);
+
+        let filename_wide: Vec<u16> = filename.encode_utf16().chain(std::iter::once(0)).collect();
+
+        // Create WIC factory
+        let wic_factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+
+        // Create stream for file
+        let stream = wic_factory.CreateStream()?;
+        stream.InitializeFromFilename(PCWSTR(filename_wide.as_ptr()), GENERIC_WRITE.0)?;
+
+        // Create PNG encoder
+        let encoder = wic_factory.CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null())?;
+        encoder.Initialize(&stream, WICBitmapEncoderNoCache)?;
+
+        // Create frame
+        let mut frame = None;
+        encoder.CreateNewFrame(&mut frame, std::ptr::null_mut())?;
+        let frame = frame.ok_or(E_POINTER)?;
+        frame.Initialize(None)?;
+        frame.SetSize(width, height)?;
+
+        // Set pixel format to BGRA (which matches our texture format)
+        let mut pixel_format = GUID_WICPixelFormat32bppBGRA;
+        frame.SetPixelFormat(&mut pixel_format)?;
+
+        // Write pixels
+        frame.WritePixels(height, stride, &pixel_buffer)?;
+
+        // Commit frame and encoder
+        frame.Commit()?;
+        encoder.Commit()?;
+
+        println!("Screenshot saved: {}", filename);
+    }
+    Ok(())
+}
+
+fn toggle_always_on_top(state: &mut CaptureState) -> Result<()> {
+    unsafe {
+        state.always_on_top = !state.always_on_top;
+
+        let hwnd_insert_after = if state.always_on_top {
+            HWND_TOPMOST
+        } else {
+            HWND_NOTOPMOST
+        };
+
+        SetWindowPos(
+            state.hwnd,
+            Some(hwnd_insert_after),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE,
+        )?;
+
+        println!(
+            "Always on top: {}",
+            if state.always_on_top {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+    }
+    Ok(())
 }
 
 fn resize_swapchain(state: &mut CaptureState, hwnd: HWND) -> Result<()> {

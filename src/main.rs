@@ -563,7 +563,7 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             }
             WM_SETCURSOR => {
                 // If the cursor is in the client area, set it to the arrow
-                if (lparam.0 as u32 & 0xFFFF) == HTCLIENT as u32 {
+                if (lparam.0 as u32 & 0xFFFF) == HTCLIENT {
                     SetCursor(LoadCursorW(None, IDC_ARROW).ok());
                     LRESULT(1) // TRUE - we handled it
                 } else {
@@ -1011,8 +1011,8 @@ fn handle_frame(state: &mut CaptureState, frame_texture: IDXGIResource, hwnd: HW
                 None,
             );
 
-            let dispatch_x = (extended_width + 7) / 8;
-            let dispatch_y = (extended_height + 7) / 8;
+            let dispatch_x = extended_width.div_ceil(8);
+            let dispatch_y = extended_height.div_ceil(8);
             state.context.Dispatch(dispatch_x, dispatch_y, 1);
 
             // Clear compute shader resources
@@ -1174,10 +1174,10 @@ fn capture_and_render_frame(state: &mut CaptureState, hwnd: HWND) -> Result<()> 
 
         match acquire_dxgi_duplication_frame(&duplication, 0) {
             Ok(frame) => {
-                if frame.info.LastPresentTime != 0 {
-                    if let Some(frame_texture) = frame.resource.clone() {
-                        handle_frame(state, frame_texture, hwnd)?;
-                    }
+                if frame.info.LastPresentTime != 0
+                    && let Some(frame_texture) = frame.resource.clone()
+                {
+                    handle_frame(state, frame_texture, hwnd)?;
                 }
                 frame.release()?;
             }

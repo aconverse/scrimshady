@@ -289,7 +289,8 @@ float4 main(float4 pos : SV_POSITION, float2 texCoord : TEXCOORD) : SV_Target {
 fn main() -> Result<()> {
     unsafe {
         // Enable DPI awareness for proper scaling
-        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
+        // Ignore errors if DPI awareness is already set
+        _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
     }
 

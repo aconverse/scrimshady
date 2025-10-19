@@ -3,6 +3,9 @@ name = "scrimshady"
 version = "0.1.0"
 edition = "2024"
 
+[build-dependencies]
+embed-resource = "2.5"
+
 [dependencies.time]
 version = "0.3.44"
 features = ["std", "local-offset", "formatting", "parsing", "macros"]

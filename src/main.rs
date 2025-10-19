@@ -383,11 +383,8 @@ fn main() -> Result<()> {
 
     // Create shaders
     let (vertex_shader, input_layout) = unsafe {
-        let mut shader_blob = None;
-        let mut error_blob = None;
-        let res = D3DCompile(
-            VERTEX_SHADER.as_ptr() as *const _,
-            VERTEX_SHADER.len(),
+        let (shader_blob, error_blob, res) = d3d_compile(
+            VERTEX_SHADER,
             PCSTR::null(),                                   // source name (optional)
             None,                                            // defines (optional)
             None,                                            // include handler (optional)
@@ -395,8 +392,6 @@ fn main() -> Result<()> {
             s!("vs_4_0"),                                    // target profile
             D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION, // compilation flags
             0,                                               // secondary flags
-            &mut shader_blob,                                // output blob
-            Some(&mut error_blob),                           // error blob
         );
         println!("vertex shader compilation complete");
 
@@ -450,11 +445,8 @@ fn main() -> Result<()> {
     println!("created vertex shader");
 
     let pixel_shader = unsafe {
-        let mut shader_blob: Option<ID3DBlob> = None;
-        let mut error_blob = None;
-        let res = D3DCompile(
-            PIXEL_SHADER_LIGHTNING.as_ptr() as *const _,
-            PIXEL_SHADER_LIGHTNING.len(),
+        let (shader_blob, error_blob, res) = d3d_compile(
+            PIXEL_SHADER_LIGHTNING,
             None,                                            // source name (optional)
             None,                                            // defines (optional)
             None,                                            // include handler (optional)
@@ -462,8 +454,6 @@ fn main() -> Result<()> {
             s!("ps_4_0"),                                    // target profile
             D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION, // compilation flags
             0,                                               // secondary flags
-            &mut shader_blob,                                // output blob
-            Some(&mut error_blob),                           // error blob
         );
         println!("pixel shader compilation complete {:?}", res);
 
@@ -487,11 +477,8 @@ fn main() -> Result<()> {
 
     // Create compute shader for texture extension
     let compute_shader = unsafe {
-        let mut shader_blob: Option<ID3DBlob> = None;
-        let mut error_blob = None;
-        let res = D3DCompile(
-            EXTEND_COMPUTE_SHADER.as_ptr() as *const _,
-            EXTEND_COMPUTE_SHADER.len(),
+        let (shader_blob, error_blob, res) = d3d_compile(
+            EXTEND_COMPUTE_SHADER,
             None,                                            // source name (optional)
             None,                                            // defines (optional)
             None,                                            // include handler (optional)
@@ -499,8 +486,6 @@ fn main() -> Result<()> {
             s!("cs_5_0"),                                    // target profile
             D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION, // compilation flags
             0,                                               // secondary flags
-            &mut shader_blob,                                // output blob
-            Some(&mut error_blob),                           // error blob
         );
         println!("compute shader compilation complete {:?}", res);
 
@@ -1347,6 +1332,42 @@ fn capture_and_render_frame(state: &mut CaptureState, hwnd: HWND) -> Result<()> 
         };
     }
     Ok(())
+}
+
+unsafe fn d3d_compile<P0, P1, P2, P3>(
+    sourcedata: &[u8],
+    psourcename: P0,
+    pdefines: Option<*const D3D_SHADER_MACRO>,
+    pinclude: P1,
+    pentrypoint: P2,
+    ptarget: P3,
+    flags1: u32,
+    flags2: u32,
+) -> (Option<ID3DBlob>, Option<ID3DBlob>, Result<()>)
+where
+    P0: windows::core::Param<PCSTR>,
+    P1: windows::core::Param<ID3DInclude>,
+    P2: windows::core::Param<PCSTR>,
+    P3: windows::core::Param<PCSTR>,
+{
+    let mut shader_blob: Option<ID3DBlob> = None;
+    let mut error_blob = None;
+    let res = unsafe {
+        D3DCompile(
+            sourcedata.as_ptr() as *const _,
+            sourcedata.len(),
+            psourcename,
+            pdefines,
+            pinclude,
+            pentrypoint,
+            ptarget,
+            flags1,
+            flags2,
+            &mut shader_blob,
+            Some(&mut error_blob),
+        )
+    };
+    (shader_blob, error_blob, res)
 }
 
 fn blob_as_slice(blob: &ID3DBlob) -> &[u8] {

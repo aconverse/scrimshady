@@ -14,6 +14,23 @@ use windows::{
     core::*,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShaderType {
+    Passthru,
+    Wobbly,
+    Lightning,
+}
+
+impl ShaderType {
+    fn name(&self) -> &'static str {
+        match self {
+            ShaderType::Passthru => "Passthrough",
+            ShaderType::Wobbly => "Wobbly",
+            ShaderType::Lightning => "Lightning",
+        }
+    }
+}
+
 struct CaptureState {
     start_time: std::time::Instant,
     device: ID3D11Device,
@@ -22,7 +39,10 @@ struct CaptureState {
     dxgi_adapter: IDXGIAdapter,
     duplication: Option<IDXGIOutputDuplication>,
     vertex_shader: ID3D11VertexShader,
-    pixel_shader: ID3D11PixelShader,
+    pixel_shader_passthru: ID3D11PixelShader,
+    pixel_shader_wobbly: ID3D11PixelShader,
+    pixel_shader_lightning: ID3D11PixelShader,
+    current_shader: ShaderType,
     compute_shader: ID3D11ComputeShader,
     extend_params_buffer: ID3D11Buffer,
     sampler: ID3D11SamplerState,
@@ -272,36 +292,46 @@ fn main() -> Result<()> {
     };
     println!("created vertex shader");
 
-    let pixel_shader = unsafe {
-        let (shader_blob, error_blob, res) = d3d_compile(
-            PIXEL_SHADER_LIGHTNING,
-            None,                                            // source name (optional)
-            None,                                            // defines (optional)
-            None,                                            // include handler (optional)
-            s!("main"),                                      // entry point
-            s!("ps_4_0"),                                    // target profile
-            D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION, // compilation flags
-            0,                                               // secondary flags
-        );
-        println!("pixel shader compilation complete {:?}", res);
+    // Helper closure to compile pixel shaders
+    let compile_pixel_shader = |shader_source: &[u8], name: &str| -> Result<ID3D11PixelShader> {
+        unsafe {
+            let (shader_blob, error_blob, res) = d3d_compile(
+                shader_source,
+                None,                                            // source name (optional)
+                None,                                            // defines (optional)
+                None,                                            // include handler (optional)
+                s!("main"),                                      // entry point
+                s!("ps_4_0"),                                    // target profile
+                D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION, // compilation flags
+                0,                                               // secondary flags
+            );
 
-        if let Some(error) = error_blob {
-            let error_message =
-                std::str::from_utf8(blob_as_slice(&error)).unwrap_or("Unknown error");
-            println!("Shader compilation error: {}", error_message);
+            if let Some(error) = error_blob {
+                let error_message =
+                    std::str::from_utf8(blob_as_slice(&error)).unwrap_or("Unknown error");
+                println!("{} shader compilation error: {}", name, error_message);
+            }
+
+            res?;
+
+            let Some(blob) = shader_blob else {
+                return Err(Error::new(E_FAIL, format!("Failed to compile {} pixel shader", name)));
+            };
+
+            let mut shader_out = None;
+            device.CreatePixelShader(blob_as_slice(&blob), None, Some(&mut shader_out))?;
+            shader_out.ok_or_else(|| E_POINTER.into())
         }
-
-        res?;
-
-        let Some(blob) = shader_blob else {
-            return Err(Error::new(E_FAIL, "Failed to compile pixel shader"));
-        };
-
-        let mut shader_out = None;
-        device.CreatePixelShader(blob_as_slice(&blob), None, Some(&mut shader_out))?;
-        shader_out.ok_or(E_POINTER)?
     };
-    println!("created pixel shader");
+
+    let pixel_shader_passthru = compile_pixel_shader(PIXEL_SHADER_PASSTHRU, "passthru")?;
+    println!("created passthru pixel shader");
+
+    let pixel_shader_wobbly = compile_pixel_shader(PIXEL_SHADER_WOBBLY, "wobbly")?;
+    println!("created wobbly pixel shader");
+
+    let pixel_shader_lightning = compile_pixel_shader(PIXEL_SHADER_LIGHTNING, "lightning")?;
+    println!("created lightning pixel shader");
 
     // Create compute shader for texture extension
     let compute_shader = unsafe {
@@ -440,7 +470,10 @@ fn main() -> Result<()> {
         dxgi_adapter,
         duplication: None,
         vertex_shader,
-        pixel_shader,
+        pixel_shader_passthru,
+        pixel_shader_wobbly,
+        pixel_shader_lightning,
+        current_shader: ShaderType::Lightning,
         compute_shader,
         extend_params_buffer,
         sampler,
@@ -458,6 +491,7 @@ fn main() -> Result<()> {
         hwnd,
     };
     println!("created capture state");
+    println!("Current shader: {} (press 1/2/3 to switch)", capture_state.current_shader.name());
 
     unsafe {
         SetWindowLongPtrW(
@@ -581,6 +615,23 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                             }
                             _ => {}
                         }
+                    } else {
+                        // Number keys for shader switching (no Ctrl needed)
+                        match vkey {
+                            0x31 => {
+                                // '1' key - Passthru
+                                set_shader(state, ShaderType::Passthru);
+                            }
+                            0x32 => {
+                                // '2' key - Wobbly
+                                set_shader(state, ShaderType::Wobbly);
+                            }
+                            0x33 => {
+                                // '3' key - Lightning
+                                set_shader(state, ShaderType::Lightning);
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 LRESULT(0)
@@ -699,6 +750,11 @@ fn save_frame_to_png(state: &mut CaptureState) -> Result<()> {
         println!("Screenshot saved: {}", filename);
     }
     Ok(())
+}
+
+fn set_shader(state: &mut CaptureState, shader_type: ShaderType) {
+    state.current_shader = shader_type;
+    println!("Switched to {} shader", shader_type.name());
 }
 
 fn toggle_always_on_top(state: &mut CaptureState) -> Result<()> {
@@ -1045,7 +1101,12 @@ fn handle_frame(state: &mut CaptureState, frame_texture: IDXGIResource, hwnd: HW
 
         // Set shaders and resources
         state.context.VSSetShader(&state.vertex_shader, None);
-        state.context.PSSetShader(&state.pixel_shader, None);
+        let active_pixel_shader = match state.current_shader {
+            ShaderType::Passthru => &state.pixel_shader_passthru,
+            ShaderType::Wobbly => &state.pixel_shader_wobbly,
+            ShaderType::Lightning => &state.pixel_shader_lightning,
+        };
+        state.context.PSSetShader(active_pixel_shader, None);
         state
             .context
             .PSSetSamplers(0, Some(&[Some(state.sampler.clone())]));

@@ -2,5 +2,7 @@
 *.pdb
 *.obj
 *.o
+*.png
+*.swp
 attic
 target/*

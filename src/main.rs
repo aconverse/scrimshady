@@ -19,6 +19,7 @@ enum ShaderType {
     Passthru,
     Wobbly,
     Lightning,
+    Sorty,
 }
 
 impl ShaderType {
@@ -27,6 +28,7 @@ impl ShaderType {
             ShaderType::Passthru => "Passthrough",
             ShaderType::Wobbly => "Wobbly",
             ShaderType::Lightning => "Lightning",
+            ShaderType::Sorty => "Sorty",
         }
     }
 }
@@ -42,6 +44,7 @@ struct CaptureState {
     pixel_shader_passthru: ID3D11PixelShader,
     pixel_shader_wobbly: ID3D11PixelShader,
     pixel_shader_lightning: ID3D11PixelShader,
+    pixel_shader_sorty: ID3D11PixelShader,
     current_shader: ShaderType,
     compute_shader: ID3D11ComputeShader,
     extend_params_buffer: ID3D11Buffer,
@@ -125,10 +128,9 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
 }";
 
 const PIXEL_SHADER_PASSTHRU: &[u8] = include_bytes!("../shaders/passthru.hlsl");
-
 const PIXEL_SHADER_WOBBLY: &[u8] = include_bytes!("../shaders/wobbly.hlsl");
-
 const PIXEL_SHADER_LIGHTNING: &[u8] = include_bytes!("../shaders/lightning.hlsl");
+const PIXEL_SHADER_SORTY: &[u8] = include_bytes!("../shaders/sorty.hlsl");
 
 fn main() -> Result<()> {
     unsafe {
@@ -333,6 +335,9 @@ fn main() -> Result<()> {
     let pixel_shader_lightning = compile_pixel_shader(PIXEL_SHADER_LIGHTNING, "lightning")?;
     println!("created lightning pixel shader");
 
+    let pixel_shader_sorty = compile_pixel_shader(PIXEL_SHADER_SORTY, "sorty")?;
+    println!("created sorty pixel shader");
+
     // Create compute shader for texture extension
     let compute_shader = unsafe {
         let (shader_blob, error_blob, res) = d3d_compile(
@@ -473,7 +478,8 @@ fn main() -> Result<()> {
         pixel_shader_passthru,
         pixel_shader_wobbly,
         pixel_shader_lightning,
-        current_shader: ShaderType::Lightning,
+        pixel_shader_sorty,
+        current_shader: ShaderType::Sorty,
         compute_shader,
         extend_params_buffer,
         sampler,
@@ -629,6 +635,9 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                             0x33 => {
                                 // '3' key - Lightning
                                 set_shader(state, ShaderType::Lightning);
+                            }
+                            0x34 => {
+                                set_shader(state, ShaderType::Sorty);
                             }
                             _ => {}
                         }
@@ -1105,6 +1114,7 @@ fn handle_frame(state: &mut CaptureState, frame_texture: IDXGIResource, hwnd: HW
             ShaderType::Passthru => &state.pixel_shader_passthru,
             ShaderType::Wobbly => &state.pixel_shader_wobbly,
             ShaderType::Lightning => &state.pixel_shader_lightning,
+            ShaderType::Sorty => &state.pixel_shader_sorty,
         };
         state.context.PSSetShader(active_pixel_shader, None);
         state

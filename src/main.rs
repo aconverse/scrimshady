@@ -14,23 +14,9 @@ use windows::{
     core::*,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ShaderType {
-    Passthru,
-    Wobbly,
-    Lightning,
-    Sorty,
-}
-
-impl ShaderType {
-    fn name(&self) -> &'static str {
-        match self {
-            ShaderType::Passthru => "Passthrough",
-            ShaderType::Wobbly => "Wobbly",
-            ShaderType::Lightning => "Lightning",
-            ShaderType::Sorty => "Sorty",
-        }
-    }
+struct PixelShaderConfig {
+    name: String,
+    compiled: ID3D11PixelShader,
 }
 
 struct CaptureState {
@@ -41,11 +27,8 @@ struct CaptureState {
     dxgi_adapter: IDXGIAdapter,
     duplication: Option<IDXGIOutputDuplication>,
     vertex_shader: ID3D11VertexShader,
-    pixel_shader_passthru: ID3D11PixelShader,
-    pixel_shader_wobbly: ID3D11PixelShader,
-    pixel_shader_lightning: ID3D11PixelShader,
-    pixel_shader_sorty: ID3D11PixelShader,
-    current_shader: ShaderType,
+    pixel_shaders: Vec<PixelShaderConfig>,
+    current_shader: usize,
     compute_shader: ID3D11ComputeShader,
     extend_params_buffer: ID3D11Buffer,
     sampler: ID3D11SamplerState,
@@ -317,7 +300,10 @@ fn main() -> Result<()> {
             res?;
 
             let Some(blob) = shader_blob else {
-                return Err(Error::new(E_FAIL, format!("Failed to compile {} pixel shader", name)));
+                return Err(Error::new(
+                    E_FAIL,
+                    format!("Failed to compile {} pixel shader", name),
+                ));
             };
 
             let mut shader_out = None;
@@ -326,17 +312,20 @@ fn main() -> Result<()> {
         }
     };
 
-    let pixel_shader_passthru = compile_pixel_shader(PIXEL_SHADER_PASSTHRU, "passthru")?;
-    println!("created passthru pixel shader");
-
-    let pixel_shader_wobbly = compile_pixel_shader(PIXEL_SHADER_WOBBLY, "wobbly")?;
-    println!("created wobbly pixel shader");
-
-    let pixel_shader_lightning = compile_pixel_shader(PIXEL_SHADER_LIGHTNING, "lightning")?;
-    println!("created lightning pixel shader");
-
-    let pixel_shader_sorty = compile_pixel_shader(PIXEL_SHADER_SORTY, "sorty")?;
-    println!("created sorty pixel shader");
+    let shader_inputs = vec![
+        ("passthru", PIXEL_SHADER_PASSTHRU),
+        ("wobbly", PIXEL_SHADER_WOBBLY),
+        ("lightning", PIXEL_SHADER_LIGHTNING),
+        ("sorty", PIXEL_SHADER_SORTY),
+    ];
+    let pixel_shaders = shader_inputs
+        .into_iter()
+        .map(|v| PixelShaderConfig {
+            name: v.0.to_string(),
+            compiled: compile_pixel_shader(v.1, v.0).unwrap(),
+        })
+        .collect::<Vec<_>>();
+    println!("compiled pixel shaders");
 
     // Create compute shader for texture extension
     let compute_shader = unsafe {
@@ -475,11 +464,8 @@ fn main() -> Result<()> {
         dxgi_adapter,
         duplication: None,
         vertex_shader,
-        pixel_shader_passthru,
-        pixel_shader_wobbly,
-        pixel_shader_lightning,
-        pixel_shader_sorty,
-        current_shader: ShaderType::Sorty,
+        pixel_shaders,
+        current_shader: 1,
         compute_shader,
         extend_params_buffer,
         sampler,
@@ -497,7 +483,11 @@ fn main() -> Result<()> {
         hwnd,
     };
     println!("created capture state");
-    println!("Current shader: {} (press 1/2/3 to switch)", capture_state.current_shader.name());
+    println!(
+        "Current shader: {} (press 1..{} to switch)",
+        capture_state.pixel_shaders.len() - 1,
+        capture_state.pixel_shaders[capture_state.current_shader].name,
+    );
 
     unsafe {
         SetWindowLongPtrW(
@@ -624,20 +614,15 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     } else {
                         // Number keys for shader switching (no Ctrl needed)
                         match vkey {
-                            0x31 => {
-                                // '1' key - Passthru
-                                set_shader(state, ShaderType::Passthru);
-                            }
-                            0x32 => {
-                                // '2' key - Wobbly
-                                set_shader(state, ShaderType::Wobbly);
-                            }
-                            0x33 => {
-                                // '3' key - Lightning
-                                set_shader(state, ShaderType::Lightning);
-                            }
-                            0x34 => {
-                                set_shader(state, ShaderType::Sorty);
+                            0x31..=0x39 => {
+                                let idx = (vkey - 0x31) as usize;
+                                if idx < state.pixel_shaders.len() {
+                                    println!(
+                                        "Switched to {} shader",
+                                        state.pixel_shaders[idx].name
+                                    );
+                                    state.current_shader = idx
+                                }
                             }
                             _ => {}
                         }
@@ -759,11 +744,6 @@ fn save_frame_to_png(state: &mut CaptureState) -> Result<()> {
         println!("Screenshot saved: {}", filename);
     }
     Ok(())
-}
-
-fn set_shader(state: &mut CaptureState, shader_type: ShaderType) {
-    state.current_shader = shader_type;
-    println!("Switched to {} shader", shader_type.name());
 }
 
 fn toggle_always_on_top(state: &mut CaptureState) -> Result<()> {
@@ -1110,12 +1090,7 @@ fn handle_frame(state: &mut CaptureState, frame_texture: IDXGIResource, hwnd: HW
 
         // Set shaders and resources
         state.context.VSSetShader(&state.vertex_shader, None);
-        let active_pixel_shader = match state.current_shader {
-            ShaderType::Passthru => &state.pixel_shader_passthru,
-            ShaderType::Wobbly => &state.pixel_shader_wobbly,
-            ShaderType::Lightning => &state.pixel_shader_lightning,
-            ShaderType::Sorty => &state.pixel_shader_sorty,
-        };
+        let active_pixel_shader = &state.pixel_shaders[state.current_shader].compiled;
         state.context.PSSetShader(active_pixel_shader, None);
         state
             .context

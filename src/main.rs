@@ -45,6 +45,7 @@ struct CaptureState {
     source_rect: RECT,
 
     always_on_top: bool,
+    paused: bool,
     hwnd: HWND,
 }
 
@@ -480,6 +481,7 @@ fn main() -> Result<()> {
         extended_uav: None,
         source_rect: RECT::default(),
         always_on_top: false,
+        paused: false,
         hwnd,
     };
     println!("created capture state");
@@ -496,8 +498,8 @@ fn main() -> Result<()> {
             Box::into_raw(Box::new(capture_state)) as isize,
         );
 
-        ShowWindow(hwnd, SW_SHOW);
-        UpdateWindow(hwnd);
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = UpdateWindow(hwnd);
     }
 
     let mut message = MSG::default();
@@ -539,9 +541,9 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     let state = &mut *state_ptr;
                     // Update screen position
                     let mut client_origin = POINT::default();
-                    ClientToScreen(hwnd, &mut client_origin);
+                    let _ = ClientToScreen(hwnd, &mut client_origin);
                     let mut client_rect = RECT::default();
-                    GetClientRect(hwnd, &mut client_rect);
+                    let _ = GetClientRect(hwnd, &mut client_rect);
                     let mut source_rect = client_rect;
                     source_rect.left += client_origin.x;
                     source_rect.right += client_origin.x;
@@ -576,11 +578,13 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut CaptureState;
                 if !state_ptr.is_null() {
                     let state = &mut *state_ptr;
-                    if let Err(e) = capture_and_render_frame(state, hwnd) {
-                        // Handle error if needed
-                        println!("error {:?}", e);
-                        if e.code() == DXGI_ERROR_ACCESS_LOST {
-                            state.duplication = None;
+                    if !state.paused {
+                        if let Err(e) = capture_and_render_frame(state, hwnd) {
+                            // Handle error if needed
+                            println!("error {:?}", e);
+                            if e.code() == DXGI_ERROR_ACCESS_LOST {
+                                state.duplication = None;
+                            }
                         }
                     }
                 }
@@ -612,9 +616,9 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                             _ => {}
                         }
                     } else {
-                        // Number keys for shader switching (no Ctrl needed)
                         match vkey {
                             0x31..=0x39 => {
+                                // Number keys for shader switching (no Ctrl needed)
                                 let idx = (vkey - 0x31) as usize;
                                 if idx < state.pixel_shaders.len() {
                                     println!(
@@ -622,6 +626,12 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                                         state.pixel_shaders[idx].name
                                     );
                                     state.current_shader = idx
+                                }
+                            }
+                            0x13 => {
+                                // 'PAUSE' key
+                                if let Err(e) = toggle_pause_and_hide(state) {
+                                    println!("Failed to toggle pause and hide: {:?}", e);
                                 }
                             }
                             _ => {}
@@ -775,6 +785,27 @@ fn toggle_always_on_top(state: &mut CaptureState) -> Result<()> {
             }
         );
     }
+    Ok(())
+}
+
+fn toggle_pause_and_hide(state: &mut CaptureState) -> Result<()> {
+    state.paused = !state.paused;
+
+    let flags = if state.paused {
+        WINDOW_DISPLAY_AFFINITY(0)
+    } else {
+        WDA_EXCLUDEFROMCAPTURE
+    };
+    unsafe { SetWindowDisplayAffinity(state.hwnd, flags) }?;
+
+    println!(
+        "Window: {}",
+        if state.paused {
+            "paused and capturable"
+        } else {
+            "rendering and excluded from capture"
+        }
+    );
     Ok(())
 }
 

@@ -26,6 +26,7 @@ The app uses:
 
 ### Window Controls
 - **Ctrl+A** - Toggle always-on-top mode for the window
+- **Pause / Break** - Mark the window as capturable and pause rendering (useful for taking screenshots)
 
 ### Capture
 - **Ctrl+S** - Save the current rendered frame as a PNG file with timestamp

@@ -30,3 +30,7 @@ The app uses:
 
 ### Capture
 - **Ctrl+S** - Save the current rendered frame as a PNG file with timestamp
+
+## Demo
+
+<img width="2004" height="1329" alt="Image" src="https://github.com/user-attachments/assets/08c90822-6811-476e-9426-95f529de5bcc" />

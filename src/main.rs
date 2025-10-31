@@ -484,9 +484,9 @@ fn main() -> Result<()> {
     };
     println!("created capture state");
     println!(
-        "Current shader: {} (press 1..{} to switch)",
-        capture_state.pixel_shaders.len() - 1,
+        "Current shader: {} (press 1 - {} to switch)",
         capture_state.pixel_shaders[capture_state.current_shader].name,
+        capture_state.pixel_shaders.len(),
     );
 
     unsafe {

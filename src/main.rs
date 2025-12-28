@@ -9,14 +9,29 @@ use windows::{
         System::LibraryLoader::*,
         UI::HiDpi::*,
         UI::Input::KeyboardAndMouse::*,
+        UI::Shell::*,
         UI::WindowsAndMessaging::*,
     },
     core::*,
 };
 
+enum ShaderType {
+    Simple(ID3D11PixelShader),
+    Tiles {
+        shader: ID3D11PixelShader,
+        spritesheet_srv: ID3D11ShaderResourceView,
+        brightness_srv: ID3D11ShaderResourceView,
+        constants_buffer: ID3D11Buffer,
+        sheet_width: u32,
+        sheet_height: u32,
+        tiles_per_row: u32,
+        total_tiles: usize,
+    },
+}
+
 struct PixelShaderConfig {
     name: String,
-    compiled: ID3D11PixelShader,
+    shader_type: ShaderType,
 }
 
 struct CaptureState {
@@ -115,6 +130,17 @@ const PIXEL_SHADER_PASSTHRU: &[u8] = include_bytes!("../shaders/passthru.hlsl");
 const PIXEL_SHADER_WOBBLY: &[u8] = include_bytes!("../shaders/wobbly.hlsl");
 const PIXEL_SHADER_LIGHTNING: &[u8] = include_bytes!("../shaders/lightning.hlsl");
 const PIXEL_SHADER_SORTY: &[u8] = include_bytes!("../shaders/sorty.hlsl");
+const PIXEL_SHADER_TILES: &[u8] = include_bytes!("../shaders/tiles.hlsl");
+const FONT_SPRITESHEET_PNG: &[u8] = include_bytes!("../shaders/font_spritesheet.png");
+
+#[repr(C)]
+struct TilesConstants {
+    source_resolution: [f32; 2],
+    tile_size: [f32; 2],
+    tiles_per_row: i32,
+    total_tiles: i32,
+    spritesheet_resolution: [f32; 2],
+}
 
 fn main() -> Result<()> {
     unsafe {
@@ -313,20 +339,177 @@ fn main() -> Result<()> {
         }
     };
 
+    // Helper closure to compile pixel shaders with shader model 5.0 (for StructuredBuffer support)
+    let compile_pixel_shader_sm5 =
+        |shader_source: &[u8], name: &str| -> Result<ID3D11PixelShader> {
+            unsafe {
+                let (shader_blob, error_blob, res) = d3d_compile(
+                    shader_source,
+                    None,                                            // source name (optional)
+                    None,                                            // defines (optional)
+                    None,                                            // include handler (optional)
+                    s!("main"),                                      // entry point
+                    s!("ps_5_0"),                                    // target profile (SM 5.0)
+                    D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION, // compilation flags
+                    0,                                               // secondary flags
+                );
+
+                if let Some(error) = error_blob {
+                    let error_message =
+                        std::str::from_utf8(blob_as_slice(&error)).unwrap_or("Unknown error");
+                    println!("{} shader compilation error: {}", name, error_message);
+                }
+
+                res?;
+
+                let Some(blob) = shader_blob else {
+                    return Err(Error::new(
+                        E_FAIL,
+                        format!("Failed to compile {} pixel shader", name),
+                    ));
+                };
+
+                let mut shader_out = None;
+                device.CreatePixelShader(blob_as_slice(&blob), None, Some(&mut shader_out))?;
+                shader_out.ok_or_else(|| E_POINTER.into())
+            }
+        };
+
     let shader_inputs = vec![
         ("passthru", PIXEL_SHADER_PASSTHRU),
         ("wobbly", PIXEL_SHADER_WOBBLY),
         ("lightning", PIXEL_SHADER_LIGHTNING),
         ("sorty", PIXEL_SHADER_SORTY),
     ];
-    let pixel_shaders = shader_inputs
+    let mut pixel_shaders = shader_inputs
         .into_iter()
         .map(|v| PixelShaderConfig {
             name: v.0.to_string(),
-            compiled: compile_pixel_shader(v.1, v.0).unwrap(),
+            shader_type: ShaderType::Simple(compile_pixel_shader(v.1, v.0).unwrap()),
         })
         .collect::<Vec<_>>();
     println!("compiled pixel shaders");
+
+    // Compile and setup tiles shader (ASCII art effect)
+    println!("Setting up tiles shader...");
+    let tiles_shader = compile_pixel_shader_sm5(PIXEL_SHADER_TILES, "tiles")?;
+
+    // Load the font spritesheet from embedded bytes
+    let (_sheet_tex, sheet_srv, sheet_w, sheet_h, pixels) =
+        load_png_from_bytes(&device, FONT_SPRITESHEET_PNG, "font_spritesheet.png")?;
+
+    // Determine tile layout (8x16 character tiles)
+    let tile_w = 8u32;
+    let tile_h = 16u32;
+    let tiles_per_row = sheet_w / tile_w;
+
+    // Compute brightness for each tile
+    let brightness = compute_tile_brightness(&pixels, sheet_w, sheet_h, tile_w, tile_h);
+
+    // Create structured buffer for brightness values
+    println!(
+        "Creating structured buffer: {} elements, {} bytes",
+        brightness.len(),
+        brightness.len() * std::mem::size_of::<f32>()
+    );
+    let brightness_buffer = unsafe {
+        let buffer_desc = D3D11_BUFFER_DESC {
+            ByteWidth: (brightness.len() * std::mem::size_of::<f32>()) as u32,
+            Usage: D3D11_USAGE_IMMUTABLE,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: D3D11_RESOURCE_MISC_BUFFER_STRUCTURED.0 as u32,
+            StructureByteStride: std::mem::size_of::<f32>() as u32,
+        };
+
+        let buffer_data = D3D11_SUBRESOURCE_DATA {
+            pSysMem: brightness.as_ptr() as *const _,
+            SysMemPitch: 0,
+            SysMemSlicePitch: 0,
+        };
+
+        let mut buffer_out = None;
+        device.CreateBuffer(&buffer_desc, Some(&buffer_data), Some(&mut buffer_out))?;
+        buffer_out.ok_or(E_POINTER)?
+    };
+    println!("Structured buffer created successfully");
+
+    // Create SRV for structured buffer
+    println!(
+        "Creating SRV for structured buffer with {} elements",
+        brightness.len()
+    );
+    let brightness_srv = unsafe {
+        let mut srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D11_SRV_DIMENSION_BUFFER,
+            Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: std::mem::zeroed(),
+            },
+        };
+
+        // Set buffer parameters through the union
+        srv_desc.Anonymous.Buffer.Anonymous1.FirstElement = 0;
+        srv_desc.Anonymous.Buffer.Anonymous2.NumElements = brightness.len() as u32;
+
+        let mut srv_out = None;
+        let result = device.CreateShaderResourceView(
+            &brightness_buffer,
+            Some(&srv_desc),
+            Some(&mut srv_out),
+        );
+        if let Err(e) = result {
+            println!("ERROR creating SRV: {:?}", e);
+            return Err(e);
+        }
+        srv_out.ok_or(E_POINTER)?
+    };
+    println!("SRV created successfully");
+
+    // Create constant buffer for tiles shader parameters
+    println!(
+        "Creating constant buffer ({} bytes)",
+        std::mem::size_of::<TilesConstants>()
+    );
+    let tiles_constants_buffer = unsafe {
+        let buffer_desc = D3D11_BUFFER_DESC {
+            ByteWidth: std::mem::size_of::<TilesConstants>() as u32,
+            Usage: D3D11_USAGE_DYNAMIC,
+            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+            CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+            MiscFlags: 0,
+            StructureByteStride: 0,
+        };
+
+        let mut buffer_out = None;
+        let result = device.CreateBuffer(&buffer_desc, None, Some(&mut buffer_out));
+        if let Err(e) = result {
+            println!("ERROR creating constant buffer: {:?}", e);
+            println!(
+                "Buffer size: {} bytes",
+                std::mem::size_of::<TilesConstants>()
+            );
+            return Err(e);
+        }
+        buffer_out.ok_or(E_POINTER)?
+    };
+    println!("Constant buffer created successfully");
+
+    // Add tiles shader to the list
+    pixel_shaders.push(PixelShaderConfig {
+        name: "tiles".to_string(),
+        shader_type: ShaderType::Tiles {
+            shader: tiles_shader,
+            spritesheet_srv: sheet_srv,
+            brightness_srv,
+            constants_buffer: tiles_constants_buffer,
+            sheet_width: sheet_w,
+            sheet_height: sheet_h,
+            tiles_per_row,
+            total_tiles: brightness.len(),
+        },
+    });
+    println!("tiles shader ready");
 
     // Create compute shader for texture extension
     let compute_shader = unsafe {
@@ -809,6 +992,155 @@ fn toggle_pause_and_hide(state: &mut CaptureState) -> Result<()> {
     Ok(())
 }
 
+fn load_png_from_bytes(
+    device: &ID3D11Device,
+    png_bytes: &[u8],
+    name: &str,
+) -> Result<(ID3D11Texture2D, ID3D11ShaderResourceView, u32, u32, Vec<u8>)> {
+    unsafe {
+        // Create WIC factory
+        let wic_factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+
+        // Create a stream from the embedded PNG bytes
+        let Some(stream) = SHCreateMemStream(Some(png_bytes)) else {
+            return Err(Error::from_thread());
+        };
+
+        // Create decoder from stream
+        let decoder = wic_factory.CreateDecoderFromStream(
+            &stream,
+            std::ptr::null(),
+            WICDecodeMetadataCacheOnDemand,
+        )?;
+
+        // Get the first frame
+        let frame = decoder.GetFrame(0)?;
+
+        // Get frame dimensions
+        let mut width = 0u32;
+        let mut height = 0u32;
+        frame.GetSize(&mut width, &mut height)?;
+
+        // Convert to BGRA format
+        let target_format = GUID_WICPixelFormat32bppBGRA;
+        let converter = wic_factory.CreateFormatConverter()?;
+        converter.Initialize(
+            &frame,
+            &target_format,
+            WICBitmapDitherTypeNone,
+            None,
+            0.0,
+            WICBitmapPaletteTypeMedianCut,
+        )?;
+
+        // Calculate stride and buffer size
+        let stride = width * 4; // 4 bytes per pixel (BGRA)
+        let buffer_size = stride * height;
+
+        // Read pixels into buffer
+        let mut pixel_buffer = vec![0u8; buffer_size as usize];
+        converter.CopyPixels(std::ptr::null(), stride, &mut pixel_buffer)?;
+
+        // Create D3D11 texture with initial data
+        let texture_desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+
+        let texture_data = D3D11_SUBRESOURCE_DATA {
+            pSysMem: pixel_buffer.as_ptr() as *const _,
+            SysMemPitch: stride,
+            SysMemSlicePitch: 0,
+        };
+
+        let mut texture = None;
+        device.CreateTexture2D(&texture_desc, Some(&texture_data), Some(&mut texture))?;
+        let texture = texture.ok_or(E_POINTER)?;
+
+        // Create shader resource view
+        let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                },
+            },
+        };
+
+        let mut srv = None;
+        device.CreateShaderResourceView(&texture, Some(&srv_desc), Some(&mut srv))?;
+        let srv = srv.ok_or(E_POINTER)?;
+
+        println!(
+            "Loaded {} ({}x{}, {} bytes)",
+            name, width, height, buffer_size
+        );
+
+        Ok((texture, srv, width, height, pixel_buffer))
+    }
+}
+
+fn compute_tile_brightness(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    tile_width: u32,
+    tile_height: u32,
+) -> Vec<f32> {
+    let tiles_per_row = width / tile_width;
+    let tiles_per_col = height / tile_height;
+    let total_tiles = tiles_per_row * tiles_per_col;
+
+    let mut brightness_values = Vec::with_capacity(total_tiles as usize);
+
+    for tile_row in 0..tiles_per_col {
+        for tile_col in 0..tiles_per_row {
+            let mut brightness_sum = 0.0f32;
+
+            // Sample the tile
+            for sy in 0..tile_height {
+                for sx in 0..tile_width {
+                    let pixel_x = tile_col * tile_width + sx;
+                    let pixel_y = tile_row * tile_height + sy;
+
+                    // Get pixel index (BGRA format)
+                    let pixel_index = ((pixel_y * width + pixel_x) * 4) as usize;
+
+                    if pixel_index + 2 < pixels.len() {
+                        let b = pixels[pixel_index] as f32 / 255.0;
+                        let g = pixels[pixel_index + 1] as f32 / 255.0;
+                        let r = pixels[pixel_index + 2] as f32 / 255.0;
+
+                        // Compute luminance using standard coefficients
+                        let luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+                        brightness_sum += luminance;
+                    }
+                }
+            }
+
+            // Average brightness for this tile
+            let avg_brightness = brightness_sum / (tile_width * tile_height) as f32;
+            brightness_values.push(avg_brightness);
+        }
+    }
+
+    brightness_values
+}
+
 fn resize_swapchain(state: &mut CaptureState, hwnd: HWND) -> Result<()> {
     // Release old views
     state.render_target_view = None;
@@ -1121,16 +1453,88 @@ fn handle_frame(state: &mut CaptureState, frame_texture: IDXGIResource, hwnd: HW
 
         // Set shaders and resources
         state.context.VSSetShader(&state.vertex_shader, None);
-        let active_pixel_shader = &state.pixel_shaders[state.current_shader].compiled;
-        state.context.PSSetShader(active_pixel_shader, None);
         state
             .context
             .PSSetSamplers(0, Some(&[Some(state.sampler.clone())]));
-        // Use the extended texture instead of staging texture
-        state.context.PSSetShaderResources(
-            0,
-            Some(&[Some(state.extended_srv.as_ref().unwrap().clone())]),
-        );
+
+        // Bind resources based on shader type
+        match &state.pixel_shaders[state.current_shader].shader_type {
+            ShaderType::Simple(shader) => {
+                state.context.PSSetShader(shader, None);
+                // Use the extended texture instead of staging texture
+                state.context.PSSetShaderResources(
+                    0,
+                    Some(&[Some(state.extended_srv.as_ref().unwrap().clone())]),
+                );
+            }
+            ShaderType::Tiles {
+                shader,
+                spritesheet_srv,
+                brightness_srv,
+                constants_buffer,
+                sheet_width,
+                sheet_height,
+                tiles_per_row,
+                total_tiles,
+            } => {
+                state.context.PSSetShader(shader, None);
+
+                // Bind 3 shader resources: t0 = source, t1 = spritesheet, t2 = brightness
+                state.context.PSSetShaderResources(
+                    0,
+                    Some(&[
+                        Some(state.extended_srv.as_ref().unwrap().clone()),
+                        Some(spritesheet_srv.clone()),
+                        Some(brightness_srv.clone()),
+                    ]),
+                );
+
+                // Update constant buffer with current source resolution
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                state.context.Map(
+                    constants_buffer,
+                    0,
+                    D3D11_MAP_WRITE_DISCARD,
+                    0,
+                    Some(&mut mapped),
+                )?;
+
+                let constants = TilesConstants {
+                    source_resolution: [extended_width as f32, extended_height as f32],
+                    tile_size: [8.0, 16.0],
+                    tiles_per_row: *tiles_per_row as i32,
+                    total_tiles: *total_tiles as i32,
+                    spritesheet_resolution: [*sheet_width as f32, *sheet_height as f32],
+                };
+
+                // Debug: print constants once
+                static mut PRINTED: bool = false;
+                if !PRINTED {
+                    println!("Tiles shader constants:");
+                    println!("  source_resolution: {:?}", constants.source_resolution);
+                    println!("  tile_size: {:?}", constants.tile_size);
+                    println!("  tiles_per_row: {}", constants.tiles_per_row);
+                    println!("  total_tiles: {}", constants.total_tiles);
+                    println!(
+                        "  spritesheet_resolution: {:?}",
+                        constants.spritesheet_resolution
+                    );
+                    PRINTED = true;
+                }
+
+                std::ptr::copy_nonoverlapping(
+                    &constants as *const _ as *const u8,
+                    mapped.pData as *mut u8,
+                    std::mem::size_of::<TilesConstants>(),
+                );
+                state.context.Unmap(constants_buffer, 0);
+
+                // Bind constant buffer to b0
+                state
+                    .context
+                    .PSSetConstantBuffers(0, Some(&[Some(constants_buffer.clone())]));
+            }
+        }
 
         // Set vertex buffer
         let stride = std::mem::size_of::<Vertex>() as u32;

@@ -18,6 +18,7 @@ The app uses:
 2. **wobbly** - Wavy distortion effect
 3. **lightning** - Lightning/electrical effect
 4. **sorty** - Pixel sorting effect
+5. **tiles** - Replace pixels with tiles from a sprite sheet
 
 ## Hotkeys
 
@@ -34,3 +35,6 @@ The app uses:
 ## Demo
 
 <img width="2004" height="1329" alt="Image" src="https://github.com/user-attachments/assets/08c90822-6811-476e-9426-95f529de5bcc" />
+
+## Acknowldegments
+Sprite sheet generated from [Cascadia Code](https://github.com/microsoft/cascadia-code)

@@ -8,7 +8,6 @@ use windows::{
         System::Com::*,
         System::LibraryLoader::*,
         UI::HiDpi::*,
-        UI::Input::KeyboardAndMouse::*,
         UI::Shell::*,
         UI::WindowsAndMessaging::*,
     },
@@ -685,6 +684,8 @@ fn main() -> Result<()> {
         let _ = UpdateWindow(hwnd);
     }
 
+    let haccel = create_accelerators()?;
+
     let mut message = MSG::default();
     loop {
         unsafe {
@@ -696,6 +697,11 @@ fn main() -> Result<()> {
                 println!("GetMessageW failed with -1");
                 break;
             }
+
+            if TranslateAcceleratorW(hwnd, *haccel, &message) != 0 {
+                continue;
+            }
+
             _ = TranslateMessage(&message);
             _ = DispatchMessageW(&message);
         }
@@ -709,6 +715,79 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+const ID_SAVE: u16 = 1001;
+const ID_ALWAYS_ON_TOP: u16 = 1002;
+const ID_TOGGLE_PAUSE: u16 = 1003;
+const ID_SHADER_BASE: u16 = 2000;
+const ID_SHADER_END: u16 = ID_SHADER_BASE + 10;
+
+fn create_accelerators() -> Result<Owned<HACCEL>> {
+    let accels = [
+        ACCEL {
+            fVirt: FCONTROL | FVIRTKEY,
+            key: b'S' as u16,
+            cmd: ID_SAVE,
+        },
+        ACCEL {
+            fVirt: FCONTROL | FVIRTKEY,
+            key: b'A' as u16,
+            cmd: ID_ALWAYS_ON_TOP,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY,
+            key: 19, // VK_PAUSE
+            cmd: ID_TOGGLE_PAUSE,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY,
+            key: b'1' as u16,
+            cmd: ID_SHADER_BASE,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY,
+            key: b'2' as u16,
+            cmd: ID_SHADER_BASE + 1,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY,
+            key: b'3' as u16,
+            cmd: ID_SHADER_BASE + 2,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY,
+            key: b'4' as u16,
+            cmd: ID_SHADER_BASE + 3,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY,
+            key: b'5' as u16,
+            cmd: ID_SHADER_BASE + 4,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY,
+            key: b'6' as u16,
+            cmd: ID_SHADER_BASE + 5,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY,
+            key: b'7' as u16,
+            cmd: ID_SHADER_BASE + 6,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY,
+            key: b'8' as u16,
+            cmd: ID_SHADER_BASE + 7,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY,
+            key: b'9' as u16,
+            cmd: ID_SHADER_BASE + 8,
+        },
+    ];
+
+    unsafe { CreateAcceleratorTableW(&accels).map(|h| Owned::new(h)) }
 }
 
 extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -773,52 +852,36 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 }
                 LRESULT(0)
             }
-            WM_KEYDOWN => {
+            WM_COMMAND => {
                 let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut CaptureState;
                 if !state_ptr.is_null() {
                     let state = &mut *state_ptr;
-                    let vkey = wparam.0 as i32;
-
-                    // Check if Ctrl is pressed
-                    let ctrl_pressed = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
-
-                    if ctrl_pressed {
-                        match vkey {
-                            0x53 => {
-                                // 'S' key
-                                if let Err(e) = save_frame_to_png(state) {
-                                    println!("Failed to save frame: {:?}", e);
-                                }
+                    let accel_id = (wparam.0 & 0xFFFF) as u16;
+                    match accel_id {
+                        ID_SAVE => {
+                            if let Err(e) = save_frame_to_png(state) {
+                                println!("Failed to save frame: {:?}", e);
                             }
-                            0x41 => {
-                                // 'A' key
-                                if let Err(e) = toggle_always_on_top(state) {
-                                    println!("Failed to toggle always on top: {:?}", e);
-                                }
-                            }
-                            _ => {}
                         }
-                    } else {
-                        match vkey {
-                            0x31..=0x39 => {
-                                // Number keys for shader switching (no Ctrl needed)
-                                let idx = (vkey - 0x31) as usize;
-                                if idx < state.pixel_shaders.len() {
-                                    println!(
-                                        "Switched to {} shader",
-                                        state.pixel_shaders[idx].name
-                                    );
-                                    state.current_shader = idx
-                                }
+                        ID_ALWAYS_ON_TOP => {
+                            if let Err(e) = toggle_always_on_top(state) {
+                                println!("Failed to toggle always on top: {:?}", e);
                             }
-                            0x13 => {
-                                // 'PAUSE' key
-                                if let Err(e) = toggle_pause_and_hide(state) {
-                                    println!("Failed to toggle pause and hide: {:?}", e);
-                                }
-                            }
-                            _ => {}
                         }
+                        ID_TOGGLE_PAUSE => {
+                            if let Err(e) = toggle_pause_and_hide(state) {
+                                println!("Failed to toggle pause and hide: {:?}", e);
+                            }
+                        }
+                        ID_SHADER_BASE..ID_SHADER_END => {
+                            // Number keys for shader switching
+                            let idx = (accel_id - ID_SHADER_BASE) as usize;
+                            if idx < state.pixel_shaders.len() {
+                                println!("Switched to {} shader", state.pixel_shaders[idx].name);
+                                state.current_shader = idx
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 LRESULT(0)
